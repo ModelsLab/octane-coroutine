@@ -208,6 +208,19 @@ return [
         */
 
         'tick' => env('OCTANE_TICK', false),
+
+        /*
+        |--------------------------------------------------------------------------
+        | Graceful Shutdown Timeout
+        |--------------------------------------------------------------------------
+        |
+        | The maximum number of seconds to wait for active coroutines to complete
+        | when a worker is stopping. If this timeout is reached, the worker
+        | will force exit even if coroutines are still running.
+        |
+        */
+        
+        'shutdown_timeout' => env('OCTANE_SHUTDOWN_TIMEOUT', 30),
     ],
 
     /*

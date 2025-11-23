@@ -19,6 +19,8 @@ use Laravel\Octane\Exceptions\TaskExceptionResult;
 use Laravel\Octane\Swoole\TaskResult;
 use RuntimeException;
 use Throwable;
+use Laravel\Octane\Swoole\Coroutine\Context;
+use Swoole\Coroutine;
 
 class Worker implements WorkerContract
 {
@@ -72,7 +74,15 @@ class Worker implements WorkerContract
         // We will clone the application instance so that we have a clean copy to switch
         // back to once the request has been handled. This allows us to easily delete
         // certain instances that got resolved / mutated during a previous request.
-        CurrentApplication::set($sandbox = clone $this->app);
+        $sandbox = clone $this->app;
+        
+        // In coroutine mode, we store the sandbox in the coroutine context.
+        // The global Container instance is a proxy that delegates to this context.
+        if (class_exists(Context::class) && Coroutine::getCid() > 0) {
+            Context::set('octane.app', $sandbox);
+        } else {
+            CurrentApplication::set($sandbox);
+        }
 
         $gateway = new ApplicationGateway($this->app, $sandbox);
 
@@ -110,12 +120,24 @@ class Worker implements WorkerContract
             $this->app->make('view.engine.resolver')->forget('blade');
             $this->app->make('view.engine.resolver')->forget('php');
 
+            if (class_exists(Context::class) && Coroutine::getCid() > 0) {
+                // Release database connections
+                if ($sandbox->bound('db')) {
+                    $db = $sandbox->make('db');
+                    if (method_exists($db, 'releaseConnections')) {
+                        $db->releaseConnections();
+                    }
+                }
+
+                Context::clear();
+            } else {
+                CurrentApplication::set($this->app);
+            }
+
             // After the request handling process has completed we will unset some variables
             // plus reset the current application state back to its original state before
             // it was cloned. Then we will be ready for the next worker iteration loop.
             unset($gateway, $sandbox, $context, $request, $response, $octaneResponse, $output);
-
-            CurrentApplication::set($this->app);
         }
     }
 

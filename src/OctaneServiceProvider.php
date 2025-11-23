@@ -43,6 +43,10 @@ class OctaneServiceProvider extends ServiceProvider
 
         $this->app->singleton('octane', Octane::class);
 
+        $this->app->singleton('db', function ($app) {
+            return new \Laravel\Octane\Swoole\Database\DatabaseManager($app, $app['db.factory']);
+        });
+
         $this->app->bind(RoadRunnerServerProcessInspector::class, function ($app) {
             return new RoadRunnerServerProcessInspector(
                 $app->make(RoadRunnerServerStateFile::class),

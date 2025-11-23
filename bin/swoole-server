@@ -5,9 +5,11 @@ use Laravel\Octane\RequestContext;
 use Laravel\Octane\Swoole\Handlers\OnManagerStart;
 use Laravel\Octane\Swoole\Handlers\OnServerStart;
 use Laravel\Octane\Swoole\Handlers\OnWorkerStart;
+use Laravel\Octane\Swoole\Handlers\OnWorkerStop;
 use Laravel\Octane\Swoole\ServerStateFile;
 use Laravel\Octane\Swoole\SwooleExtension;
 use Laravel\Octane\Swoole\WorkerState;
+use Laravel\Octane\Swoole\Coroutine\Context;
 use Swoole\Coroutine;
 use Swoole\Http\Server;
 use Swoole\Timer;
@@ -189,6 +191,14 @@ $server->on('request', function ($request, $response) use ($server, $workerState
         if ($workerState->timerTable) {
             $workerState->timerTable->del(Coroutine::getCid());
         }
+        
+        // CRITICAL FIX: Return worker to the pool!
+        if ($workerState->clientPool && $worker) {
+            $workerState->clientPool->push($worker);
+        }
+        
+        // Ensure coroutine context is cleared (Swoole does this automatically, but explicit is safe)
+        Context::clear();
     }
 });
 
@@ -224,15 +234,12 @@ $server->on('finish', fn (Server $server, int $taskId, $result) => $result);
 |
 */
 
-$server->on('workerstop', function ($server, $workerId) use ($workerState) {
-    $isTaskWorker = $workerId >= ($server->setting['worker_num'] ?? 0);
-    $workerType = $isTaskWorker ? 'TASK WORKER' : 'WORKER';
-    
-    // Try to get request count if available (might not be accessible depending on Swoole version)
-    $maxRequest = $server->setting['max_request'] ?? 'unknown';
-    
-    error_log("💀 {$workerType} #{$workerId} STOPPING (max_request limit: {$maxRequest})");
-    
+$server->on('workerstop', function ($server, $workerId) use ($workerState, $serverState) {
+    // Use the new graceful shutdown handler
+    (new OnWorkerStop(
+        $serverState['octaneConfig']['swoole']['shutdown_timeout'] ?? 30
+    ))($server, $workerId);
+
     if ($workerState->tickTimerId) {
         Timer::clear($workerState->tickTimerId);
     }

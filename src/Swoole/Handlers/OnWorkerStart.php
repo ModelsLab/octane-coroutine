@@ -4,6 +4,8 @@ namespace Laravel\Octane\Swoole\Handlers;
 
 use Laravel\Octane\ApplicationFactory;
 use Laravel\Octane\Stream;
+use Laravel\Octane\Swoole\Coroutine\Context;
+use Laravel\Octane\Swoole\Coroutine\CoordinatorManager;
 use Laravel\Octane\Swoole\SwooleClient;
 use Laravel\Octane\Swoole\SwooleExtension;
 use Laravel\Octane\Swoole\WorkerState;
@@ -11,6 +13,8 @@ use Laravel\Octane\Worker;
 use Swoole\Coroutine\Channel;
 use Swoole\Http\Server;
 use Throwable;
+use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
+use Illuminate\Container\Container;
 
 class OnWorkerStart
 {
@@ -50,7 +54,7 @@ class OnWorkerStart
         $this->workerState->server = $server;
         $this->workerState->workerId = $workerId;
         $this->workerState->workerPid = posix_getpid();
-        $this->workerState->worker = $this->bootWorker($server);
+        $this->workerState->worker = $this->bootWorker($server, $workerId);
 
         $this->dispatchServerTickTaskEverySecond($server);
         $this->streamRequestsToConsole($server);
@@ -73,7 +77,7 @@ class OnWorkerStart
      * @param  \Swoole\Http\Server  $server
      * @return \Laravel\Octane\Worker|null
      */
-    protected function bootWorker($server)
+    protected function bootWorker($server, $workerId)
     {
         try {
             $poolConfig = $this->serverState['octaneConfig']['swoole']['pool'] ?? [];
@@ -92,6 +96,9 @@ class OnWorkerStart
                 // CRITICAL FIX: Clear Facade resolved instances to prevent state leaks (e.g. Breadcrumbs)
                 \Illuminate\Support\Facades\Facade::clearResolvedInstances();
                 
+                // Clear coroutine context to ensure clean state for each worker
+                Context::clear();
+                
                 $worker = new Worker(
                     new ApplicationFactory($this->basePath),
                     new SwooleClient
@@ -103,6 +110,10 @@ class OnWorkerStart
                     WorkerState::class => $this->workerState,
                 ]);
                 
+                // Store worker metadata in context
+                Context::set("worker.{$i}.created_at", time());
+                Context::set("worker.{$i}.pool_index", $i);
+                
                 $this->workerState->clientPool->push($worker);
             }
 
@@ -111,7 +122,21 @@ class OnWorkerStart
             $this->workerState->clientPool->push($this->workerState->worker);
             $this->workerState->client = $this->workerState->worker->getClient() ?? new SwooleClient;
 
+            // Install CoroutineApplication proxy as the global container instance
+            $baseApp = $this->workerState->worker->application();
+            $coroutineApp = new CoroutineApplication($baseApp);
+            Container::setInstance($coroutineApp);
+
+            // Store worker pool in context for easy access
+            Context::set('octane.worker_pool', $this->workerState->clientPool);
+            Context::set('octane.worker_id', $workerId);
+            Context::set('octane.worker_pid', $this->workerState->workerPid);
+            Context::set('octane.pool_size', $poolSize);
+
             error_log("✅ Worker pool created successfully with {$poolSize} instances");
+
+            // Signal that worker initialization is complete
+            CoordinatorManager::until(CoordinatorManager::WORKER_START)->resume();
 
             return $this->workerState->worker;
         } catch (Throwable $e) {
