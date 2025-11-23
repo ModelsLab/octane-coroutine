@@ -32,7 +32,14 @@ class Stream
     public static function throwable(Throwable $throwable)
     {
         $fallbackTrace = str_starts_with($throwable->getFile(), ClosureStream::STREAM_PROTO.'://')
-            ? collect($throwable->getTrace())->whereNotNull('file')->first()
+            ? (function () use ($throwable) {
+                foreach ($throwable->getTrace() as $trace) {
+                    if (isset($trace['file'])) {
+                        return $trace;
+                    }
+                }
+                return null;
+            })()
             : null;
 
         Octane::writeError(json_encode([

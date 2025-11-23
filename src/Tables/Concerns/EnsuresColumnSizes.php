@@ -2,7 +2,7 @@
 
 namespace Laravel\Octane\Tables\Concerns;
 
-use Illuminate\Support\Arr;
+
 use Laravel\Octane\Exceptions\ValueTooLargeForColumnException;
 use Swoole\Table;
 
@@ -11,12 +11,12 @@ trait EnsuresColumnSizes
     /**
      * Ensures the given column value is within the given size.
      *
-     * @return void
+     * @return \Closure
      */
     protected function ensureColumnsSize()
     {
         return function ($value, $column) {
-            if (! Arr::has($this->columns, $column)) {
+            if (! array_key_exists($column, $this->columns)) {
                 return;
             }
 

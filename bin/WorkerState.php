@@ -27,4 +27,6 @@ class WorkerState
     public $tickTimerId;
 
     public $lastRequestTime;
+
+    public $ready = false;
 }

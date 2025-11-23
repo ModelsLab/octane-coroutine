@@ -114,6 +114,11 @@ $server->on('workerstart', fn (Server $server, $workerId) =>
 $server->on('request', function ($request, $response) use ($server, $workerState, $serverState) {
     $workerState->lastRequestTime = microtime(true);
 
+    // Wait for worker to be fully initialized
+    while (! ($workerState->ready ?? false)) {
+        usleep(10000); // 10ms
+    }
+
     // Get a worker from the pool with a timeout (Queuing mechanism)
     $worker = null;
     if ($workerState->clientPool) {

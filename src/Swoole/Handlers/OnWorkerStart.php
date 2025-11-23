@@ -138,6 +138,8 @@ class OnWorkerStart
             // Signal that worker initialization is complete
             CoordinatorManager::until(CoordinatorManager::WORKER_START)->resume();
 
+            $this->workerState->ready = true;
+
             return $this->workerState->worker;
         } catch (Throwable $e) {
             Stream::shutdown($e);
