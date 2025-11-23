@@ -13,7 +13,7 @@ Swoole\Coroutine::set([
     'max_coroutine' => 100000,
 ]);
 
-Runtime::enableCoroutine(true, SWOOLE_HOOK_ALL);
+Runtime::enableCoroutine(SWOOLE_HOOK_ALL);
 
 /*
 |--------------------------------------------------------------------------
