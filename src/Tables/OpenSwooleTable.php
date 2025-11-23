@@ -2,6 +2,7 @@
 
 namespace Laravel\Octane\Tables;
 
+use Illuminate\Support\Collection;
 use Swoole\Table;
 
 class OpenSwooleTable extends Table
@@ -30,7 +31,7 @@ class OpenSwooleTable extends Table
      */
     public function set(string $key, array $values): bool
     {
-        collect($values)
+        Collection::make($values)
             ->each($this->ensureColumnsSize());
 
         return parent::set($key, $values);

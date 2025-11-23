@@ -78,6 +78,38 @@ composer update
 php artisan octane:install swoole
 ```
 
+> [!WARNING]
+> **⚠️ Experimental Package**: This package is under **active development** with frequent updates and improvements. It is **not yet production-ready** and breaking changes may occur. Use at your own risk and thoroughly test in staging environments.
+
+### Updating the Package
+
+Since this package is rapidly evolving with frequent bug fixes and performance improvements, you should update it regularly:
+
+```bash
+# Update to the latest version
+composer update modelslab/octane-coroutine
+
+# Force a fresh install if needed
+composer update modelslab/octane-coroutine --prefer-source
+
+# Clear caches after updating
+php artisan config:clear
+php artisan cache:clear
+php artisan octane:reload
+```
+
+**Tip**: Pin your production deployments to specific commits until the package reaches stable release:
+
+```json
+{
+    "require": {
+        "modelslab/octane-coroutine": "dev-main#abc1234"
+    }
+}
+```
+
+Replace `abc1234` with the specific commit hash you've tested.
+
 ## 🔧 Configuration
 
 The package works out-of-the-box with sensible defaults. Coroutines are **enabled by default** with runtime hooks.
