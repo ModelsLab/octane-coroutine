@@ -30,7 +30,7 @@ class SwooleTable extends Table
      */
     public function set(string $key, array $values): bool
     {
-        collect($values)
+        \collect($values)
             ->each($this->ensureColumnsSize());
 
         return parent::set($key, $values);
