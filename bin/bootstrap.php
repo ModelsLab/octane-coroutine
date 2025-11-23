@@ -4,6 +4,17 @@ ini_set('display_errors', 'stderr');
 
 $_ENV['APP_RUNNING_IN_CONSOLE'] = false;
 
+use Swoole\Runtime;
+
+// Configure coroutine settings BEFORE any coroutine operations
+// max_coroutine: Maximum number of concurrent coroutines (application-level concurrency)
+// Default: 3000, Recommended for high traffic: 100000
+Swoole\Coroutine::set([
+    'max_coroutine' => 100000,
+]);
+
+Runtime::enableCoroutine(true, SWOOLE_HOOK_ALL);
+
 /*
 |--------------------------------------------------------------------------
 | Find Application Base Path

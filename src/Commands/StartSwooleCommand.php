@@ -126,29 +126,76 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
     /**
      * Get the default Swoole server options.
      *
+     * These defaults can be overridden by setting config('octane.swoole.options').
+     * For example, in config/octane.php:
+     *
+     *   'swoole' => [
+     *       'options' => [
+     *           'worker_num' => 16,
+     *           'backlog' => 8192,
+     *       ],
+     *   ],
+     *
      * @return array
      */
     protected function defaultServerOptions(SwooleExtension $extension)
     {
-        return [
+        return array_merge([
+            // Enable coroutine support for async I/O operations
             'enable_coroutine' => true,
+            
+            // Don't run as a daemon process (for compatibility with process managers)
             'daemonize' => false,
+            
+            // Log file location for Swoole internal logs
             'log_file' => storage_path('logs/swoole_http.log'),
+            
+            // Log level: INFO in local, ERROR in production for better performance
             'log_level' => app()->environment('local') ? SWOOLE_LOG_INFO : SWOOLE_LOG_ERROR,
+            
+            // Max requests per worker before restart (prevents memory leaks)
             'max_request' => $this->option('max-requests'),
+            
+            // Max size of request/response package (10MB)
             'package_max_length' => 10 * 1024 * 1024,
+            
+            // Number of reactor threads (set to CPU count for optimal performance)
             'reactor_num' => $this->workerCount($extension),
+            
+            // Enable asynchronous worker reload for zero-downtime deploys
             'reload_async' => true,
+            
+            // Max seconds to wait for async reload to complete
             'max_wait_time' => 60,
-            'backlog' => 4096,
+            
+            // TCP connection queue size (OS-level, NOT coroutine limit)
+            // This is the backlog of PENDING connections waiting to be accepted.
+            // Note: This is different from max_coroutine (application-level concurrency).
+            // - backlog: OS network layer, queues incoming TCP connection attempts
+            // - max_coroutine: Application layer, limits concurrent request processing
+            'backlog' => 8192,
+            
+            // Maximum number of concurrent TCP connections the server can maintain
             'max_conn' => 10000,
+            
+            // Enable TCP_NODELAY to reduce latency (disables Nagle's algorithm)
             'open_tcp_nodelay' => true,
+            
+            // Yield CPU when sending data to prevent blocking other coroutines
             'send_yield' => true,
+            
+            // Socket buffer size (10MB)
             'socket_buffer_size' => 10 * 1024 * 1024,
+            
+            // Max requests per task worker before restart
             'task_max_request' => $this->option('max-requests'),
+            
+            // Number of task workers
             'task_worker_num' => $this->taskWorkerCount($extension),
+            
+            // Number of worker processes
             'worker_num' => $this->workerCount($extension),
-        ];
+        ], config('octane.swoole.options', []));
     }
 
     /**
