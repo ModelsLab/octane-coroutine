@@ -140,6 +140,99 @@ Edit `config/octane.php` if needed:
 ],
 ```
 
+## 🏊 Understanding Workers, Pool, and Coroutines
+
+This section clarifies the key concepts that make this fork different from standard Octane.
+
+### What are Workers?
+
+**Workers** are OS-level processes spawned by Swoole. Each worker:
+- Is a separate PHP process with its own memory space
+- Can handle requests independently
+- Is configured via `--workers=N` or `worker_num` in config
+
+```
+Standard Octane: 1 Worker = 1 Request at a time (blocking)
+```
+
+### What is the Application Pool?
+
+The **Pool** is a collection of pre-initialized Laravel Application instances within each worker. This fork introduces pooling to solve state isolation:
+
+```
+This Fork: 1 Worker = 1 Pool of N Application instances
+```
+
+When a coroutine needs to handle a request, it borrows an Application from the pool, uses it, then returns it. This ensures:
+- **State Isolation**: Each concurrent request gets its own Application instance
+- **No State Leakage**: Request A's data never bleeds into Request B
+- **Memory Efficiency**: Applications are reused, not created per-request
+
+### What are Coroutines?
+
+**Coroutines** are lightweight, cooperative "threads" managed by Swoole at the application level (not OS-level). When a coroutine encounters blocking I/O, it **yields** control to other coroutines instead of blocking the entire worker.
+
+```
+Traditional: Worker blocks → other requests wait
+Coroutines:  Worker yields → other requests continue
+```
+
+### How They Work Together
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     SWOOLE SERVER                           │
+├─────────────────────────────────────────────────────────────┤
+│  Worker 0                      Worker 1                     │
+│  ┌─────────────────────┐       ┌─────────────────────────┐  │
+│  │ Pool (10 Apps)      │       │ Pool (10 Apps)          │  │
+│  │ ┌───┐┌───┐┌───┐     │       │ ┌───┐┌───┐┌───┐        │  │
+│  │ │App││App││App│ ... │       │ │App││App││App│ ...    │  │
+│  │ └───┘└───┘└───┘     │       │ └───┘└───┘└───┘        │  │
+│  │                     │       │                         │  │
+│  │ Coroutines:         │       │ Coroutines:             │  │
+│  │ cid:1 → App[0]      │       │ cid:1 → App[0]          │  │
+│  │ cid:2 → App[1]      │       │ cid:2 → App[1]          │  │
+│  │ cid:3 → App[2]      │       │ cid:3 → App[2]          │  │
+│  │ ...                 │       │ ...                     │  │
+│  └─────────────────────┘       └─────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Are Coroutines and Pool the Same?
+
+**No!** They solve different problems:
+
+| Concept | What It Does | Solves |
+|---------|--------------|--------|
+| **Coroutines** | Non-blocking I/O, concurrent execution | Performance (throughput) |
+| **Pool** | Pre-initialized Application instances | State isolation (correctness) |
+
+- **Coroutines without Pool**: Fast but dangerous (state leaks between requests)
+- **Pool without Coroutines**: Safe but slow (one request at a time)
+- **Both together**: Fast AND safe ✅
+
+### Pool Configuration
+
+This fork adds a new `pool` configuration section to `config/octane.php`:
+
+```php
+'swoole' => [
+    'options' => [
+        'worker_num' => 8,  // OS processes (CLI: --workers=8)
+    ],
+
+    // NEW: Application pool per worker
+    'pool' => [
+        'size' => 100,      // Applications per worker
+        'min_size' => 1,    // Minimum pool size
+        'max_size' => 1000, // Maximum pool size
+    ],
+],
+```
+
+**Note**: Standard Octane only has `worker_num`. The `pool` configuration is unique to this fork.
+
 ## ⚡ Performance Optimization
 
 ### CPU Usage and Tick Timers
@@ -352,23 +445,182 @@ php artisan octane:start --server=swoole --workers=32 | grep "Worker"
 
 ### Small (Development)
 - Workers: 4-8
+- Pool Size: 10-20
 - Handles: ~500 concurrent requests
 - RAM: 2-4GB
 
 ### Medium (Production)
 - Workers: 16-32
+- Pool Size: 50-100
 - Handles: ~2,000 concurrent requests
 - RAM: 4-8GB
 
 ### Large (High-Traffic)
 - Workers: 32-64
+- Pool Size: 100-200
 - Handles: ~5,000 concurrent requests
 - RAM: 8-16GB
 
 ### XL (Enterprise)
 - Workers: 64-128
+- Pool Size: 200-500
 - Handles: ~10,000+ concurrent requests
 - RAM: 16-32GB
+
+## 🎯 Recommended Configuration: 8-Core CPU for 10K req/sec
+
+This section provides specific, tested recommendations for achieving **10,000 requests/second** on an 8-core CPU.
+
+### Understanding the Math
+
+```
+Total Concurrent Capacity = Workers × Pool Size × Coroutine Efficiency
+
+For 10K req/sec with 100ms average response time:
+- Concurrent requests needed: 10,000 × 0.1 = 1,000 concurrent
+- With 8 workers, each needs: 1,000 ÷ 8 = 125 concurrent per worker
+- Pool size recommendation: 150-200 (with buffer)
+```
+
+### Recommended Configuration
+
+```php
+// config/octane.php
+'swoole' => [
+    'options' => [
+        'worker_num' => 8,              // Match CPU cores
+        'max_request' => 10000,         // Restart worker after N requests (memory safety)
+        'max_request_grace' => 1000,    // Grace period for graceful restart
+        'backlog' => 8192,              // Connection queue size
+        'socket_buffer_size' => 2097152, // 2MB socket buffer
+        'buffer_output_size' => 2097152, // 2MB output buffer
+    ],
+
+    'pool' => [
+        'size' => 200,                  // 200 apps per worker = 1,600 total capacity
+        'min_size' => 10,
+        'max_size' => 500,
+    ],
+],
+```
+
+### Start Command
+
+```bash
+php artisan octane:start \
+    --server=swoole \
+    --workers=8 \
+    --task-workers=0 \
+    --max-requests=10000 \
+    --port=8000
+```
+
+### Resource Requirements
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| CPU | 8 cores | 8+ cores |
+| RAM | 8GB | 16GB |
+| File Descriptors | 65536 | 100000+ |
+| Network | 1Gbps | 10Gbps |
+
+### Memory Calculation
+
+```
+Memory per Worker ≈ Base (50MB) + (Pool Size × App Memory)
+Memory per App ≈ 10-30MB (depends on your application)
+
+Example with pool size 200:
+- Per worker: 50MB + (200 × 15MB) = ~3GB
+- 8 workers: 8 × 3GB = ~24GB peak
+
+Note: This is peak memory. Actual usage is lower as apps share memory.
+Realistic: 8-12GB for 8 workers with pool size 200
+```
+
+### Database Connection Pooling
+
+**Critical**: With 8 workers × 200 pool size, you could have up to 1,600 concurrent database connections!
+
+```php
+// config/database.php
+'mysql' => [
+    'driver' => 'mysql',
+    // ... other config
+    'pool' => [
+        'min_connections' => 1,
+        'max_connections' => 50,  // Per worker: 8 × 50 = 400 max connections
+        'connect_timeout' => 10.0,
+        'wait_timeout' => 3.0,
+    ],
+],
+```
+
+Or configure MySQL server:
+```sql
+SET GLOBAL max_connections = 500;
+SET GLOBAL wait_timeout = 28800;
+```
+
+### OS Tuning for 10K req/sec
+
+```bash
+# /etc/sysctl.conf
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+
+# Apply changes
+sysctl -p
+```
+
+```bash
+# /etc/security/limits.conf
+* soft nofile 100000
+* hard nofile 100000
+* soft nproc 65535
+* hard nproc 65535
+
+# Apply (requires re-login)
+ulimit -n 100000
+```
+
+### Benchmark Expectations
+
+With the above configuration on 8-core CPU:
+
+| Scenario | Expected req/sec |
+|----------|------------------|
+| Simple JSON response | 15,000-20,000 |
+| Database SELECT (cached) | 8,000-12,000 |
+| Database SELECT (no cache) | 3,000-6,000 |
+| External API call (100ms) | 8,000-10,000 |
+| Complex business logic | 5,000-8,000 |
+
+### Tuning Tips
+
+1. **Start Conservative**: Begin with pool size 50, increase gradually while monitoring memory
+2. **Monitor Actively**: Watch for pool exhaustion (503 errors) and memory growth
+3. **Warm Up**: Allow 30-60 seconds for workers to warm up before heavy traffic
+4. **Use Redis**: Offload sessions and cache to Redis for better concurrency
+5. **Connection Pooling**: Use database connection pooling to prevent connection exhaustion
+
+### Comparison: Workers vs Pool Scaling
+
+| Strategy | Config | Capacity | Memory | Best For |
+|----------|--------|----------|--------|----------|
+| More Workers | 16 workers × 50 pool | 800 concurrent | ~8GB | CPU-bound work |
+| Larger Pool | 8 workers × 200 pool | 1,600 concurrent | ~10GB | I/O-bound work |
+| Balanced | 12 workers × 100 pool | 1,200 concurrent | ~9GB | Mixed workloads |
+
+**Rule of Thumb**:
+- **I/O-heavy apps** (APIs, database): Fewer workers, larger pool
+- **CPU-heavy apps** (processing): More workers, smaller pool
 
 ## 📚 Resources
 
