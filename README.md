@@ -2,6 +2,8 @@
 
 ⚡ **High-performance Laravel** with true coroutine support for massive concurrency [Still in Development]
 
+[![Packagist Version](https://img.shields.io/packagist/v/modelslab/octane-coroutine.svg)](https://packagist.org/packages/modelslab/octane-coroutine)
+[![Packagist Downloads](https://img.shields.io/packagist/dt/modelslab/octane-coroutine.svg)](https://packagist.org/packages/modelslab/octane-coroutine)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
 [![PHP Version](https://img.shields.io/badge/php-%5E8.1-777BB4.svg)](https://php.net)
 [![Laravel](https://img.shields.io/badge/laravel-%5E10%7C%5E11%7C%5E12-FF2D20.svg)](https://laravel.com)
@@ -49,33 +51,26 @@ With the same 1-second blocking operations, this achieves **2,773+ requests/seco
 
 ## 📦 Installation
 
-Since this package replaces Laravel Octane, install it directly from GitHub:
+Install via Composer from [Packagist](https://packagist.org/packages/modelslab/octane-coroutine):
 
 ```bash
-composer require modelslab/octane-coroutine:dev-main
+composer require modelslab/octane-coroutine
 ```
 
-Or add to your `composer.json`:
-
-```json
-{
-    "repositories": [
-        {
-            "type": "vcs",
-            "url": "https://github.com/ModelsLab/octane-coroutine"
-        }
-    ],
-    "require": {
-        "modelslab/octane-coroutine": "dev-main"
-    }
-}
-```
-
-Then run:
+Then install Octane with Swoole:
 
 ```bash
-composer update
 php artisan octane:install swoole
+```
+
+### Specific Version
+
+```bash
+# Install latest stable
+composer require modelslab/octane-coroutine:^0.7
+
+# Install development version
+composer require modelslab/octane-coroutine:dev-main
 ```
 
 > [!WARNING]
@@ -83,14 +78,9 @@ php artisan octane:install swoole
 
 ### Updating the Package
 
-Since this package is rapidly evolving with frequent bug fixes and performance improvements, you should update it regularly:
-
 ```bash
 # Update to the latest version
 composer update modelslab/octane-coroutine
-
-# Force a fresh install if needed
-composer update modelslab/octane-coroutine --prefer-source
 
 # Clear caches after updating
 php artisan config:clear
@@ -98,17 +88,15 @@ php artisan cache:clear
 php artisan octane:reload
 ```
 
-**Tip**: Pin your production deployments to specific commits until the package reaches stable release:
+**Tip**: Pin your production deployments to specific versions:
 
 ```json
 {
     "require": {
-        "modelslab/octane-coroutine": "dev-main#abc1234"
+        "modelslab/octane-coroutine": "^0.7.7"
     }
 }
 ```
-
-Replace `abc1234` with the specific commit hash you've tested.
 
 ## 🔧 Configuration
 
