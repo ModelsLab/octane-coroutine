@@ -143,9 +143,12 @@ class OnWorkerStart
     protected function bootHttpWorker($server, int $workerId)
     {
         $poolConfig = $this->serverState['octaneConfig']['swoole']['pool'] ?? [];
-        $poolSize = $poolConfig['size'] ?? 256;
+        // Pool size determines concurrent requests per Swoole worker
+        // Each pool member is a Worker with its own Laravel app (~50-100MB each)
+        // Trade-off: higher = more concurrency but more memory
+        $poolSize = $poolConfig['size'] ?? 10;
         $minSize = $poolConfig['min_size'] ?? 1;
-        $maxSize = $poolConfig['max_size'] ?? 1000;
+        $maxSize = $poolConfig['max_size'] ?? 100;
 
         $poolSize = max($minSize, min($maxSize, $poolSize));
 
