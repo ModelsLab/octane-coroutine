@@ -127,6 +127,8 @@ class OnWorkerStart
             WorkerState::class => $this->workerState,
         ]);
 
+        $this->configureRedisForCoroutineWorker($worker, 0, $workerId);
+
         $this->workerState->worker = $worker;
         $this->workerState->client = $worker->getClient() ?? new SwooleClient;
         $this->workerState->ready = true;
@@ -172,11 +174,13 @@ class OnWorkerStart
                 new SwooleClient
             );
 
-            $worker->boot([
-                'octane.cacheTable' => $this->workerState->cacheTable,
-                Server::class => $server,
-                WorkerState::class => $this->workerState,
-            ]);
+        $worker->boot([
+            'octane.cacheTable' => $this->workerState->cacheTable,
+            Server::class => $server,
+            WorkerState::class => $this->workerState,
+        ]);
+
+            $this->configureRedisForCoroutineWorker($worker, $i, $workerId);
 
             // Store worker metadata in context
             Context::set("worker.{$i}.created_at", time());
@@ -211,12 +215,167 @@ class OnWorkerStart
 
         error_log("✅ Worker pool created successfully with {$poolSize} instances");
 
+        $this->warnIfDatabasePoolMinExceedsMaxConnections($this->workerState->worker, $server);
+
         // Signal that worker initialization is complete
         CoordinatorManager::until(CoordinatorManager::WORKER_START)->resume();
 
         $this->workerState->ready = true;
 
         return $this->workerState->worker;
+    }
+
+    /**
+     * Ensure Redis connections are safe for concurrent coroutines.
+     *
+     * Persistent phpredis connections are shared across instances in the same
+     * process when the persistent_id is identical. In coroutine mode this can
+     * cause cross-request contention or hangs. We assign a unique persistent_id
+     * per pool worker to prevent shared sockets.
+     *
+     * @param  \Laravel\Octane\Worker  $worker
+     * @param  int  $poolIndex
+     * @param  int  $workerId
+     * @return void
+     */
+    protected function configureRedisForCoroutineWorker(Worker $worker, int $poolIndex, int $workerId): void
+    {
+        $app = $worker->application();
+
+        if (! $app->bound('config')) {
+            return;
+        }
+
+        $config = $app->make('config');
+        $redisConfig = $config->get('database.redis');
+
+        if (! is_array($redisConfig)) {
+            return;
+        }
+
+        $connectionNames = array_filter(array_keys($redisConfig), function ($name) {
+            return ! in_array($name, ['client', 'options', 'clusters'], true);
+        });
+
+        $suffix = 'octane_worker_'.$workerId.'_pool_'.$poolIndex.'_'.getmypid();
+        $updated = false;
+
+        foreach ($connectionNames as $name) {
+            if (! is_array($redisConfig[$name])) {
+                continue;
+            }
+
+            if (($redisConfig[$name]['persistent'] ?? false) === true) {
+                $baseId = $redisConfig[$name]['persistent_id'] ?? "octane_redis_{$name}";
+                $redisConfig[$name]['persistent_id'] = $baseId.'_'.$suffix;
+                $updated = true;
+            }
+        }
+
+        if (($config->get('session.driver') ?? null) === 'redis' &&
+            empty($config->get('session.connection')) &&
+            isset($redisConfig['session'])) {
+            $config->set('session.connection', 'session');
+        }
+
+        if ($updated) {
+            $config->set('database.redis', $redisConfig);
+
+            if ($app->bound('redis')) {
+                $redis = $app->make('redis');
+                foreach ($connectionNames as $name) {
+                    $redis->purge($name);
+                }
+            }
+        }
+    }
+
+    protected function warnIfDatabasePoolMinExceedsMaxConnections(Worker $worker, Server $server): void
+    {
+        $app = $worker->application();
+
+        if (! $app->bound('config')) {
+            return;
+        }
+
+        $config = $app->make('config');
+        $connections = $config->get('database.connections', []);
+
+        if (! is_array($connections) || empty($connections)) {
+            return;
+        }
+
+        $workerNum = (int) ($server->setting['worker_num'] ?? 1);
+        if ($workerNum < 1) {
+            $workerNum = 1;
+        }
+
+        $buffer = (int) ($config->get('octane.swoole.pool.db_max_connections_buffer', 10));
+        if ($buffer < 0) {
+            $buffer = 0;
+        }
+
+        $db = $app->make('db');
+
+        foreach ($connections as $name => $connectionConfig) {
+            if (! is_array($connectionConfig)) {
+                continue;
+            }
+
+            $driver = $connectionConfig['driver'] ?? null;
+            if (! in_array($driver, ['mysql', 'mariadb'], true)) {
+                continue;
+            }
+
+            $poolConfig = $connectionConfig['pool'] ?? [];
+            $minConnections = 1;
+            if (is_array($poolConfig)) {
+                $minConnections = (int) ($poolConfig['min_connections'] ?? 1);
+            }
+
+            if ($minConnections <= 0) {
+                continue;
+            }
+
+            $maxConnections = $this->fetchMysqlMaxConnections($db, $name);
+
+            if ($maxConnections === null) {
+                continue;
+            }
+
+            $maxAllowed = $maxConnections - $buffer;
+
+            if ($maxAllowed <= 0) {
+                continue;
+            }
+
+            $totalMin = $minConnections * $workerNum;
+
+            if ($totalMin > $maxAllowed) {
+                error_log("Warning: DB pool min_connections ({$minConnections}) * worker_num ({$workerNum}) = {$totalMin} exceeds max_connections ({$maxConnections}) minus buffer ({$buffer}) for connection '{$name}'.");
+            }
+        }
+    }
+
+    protected function fetchMysqlMaxConnections($db, string $connectionName): ?int
+    {
+        try {
+            $connection = $db->connection($connectionName);
+            $result = $connection->selectOne('SELECT @@max_connections AS max_connections');
+            $connection->disconnect();
+
+            if (is_object($result) && isset($result->max_connections)) {
+                return (int) $result->max_connections;
+            }
+
+            if (is_array($result) && isset($result['max_connections'])) {
+                return (int) $result['max_connections'];
+            }
+        } catch (Throwable $e) {
+            return null;
+        }
+
+        return null;
     }
 
     /**

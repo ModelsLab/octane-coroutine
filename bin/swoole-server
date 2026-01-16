@@ -125,17 +125,31 @@ $server->on('request', function ($request, $response) use ($server, $workerState
     // Get a worker from the pool with a timeout (Queuing mechanism)
     $worker = null;
     if ($workerState->clientPool) {
-        // Wait up to 30 seconds for a free worker
-        $worker = $workerState->clientPool->pop(30.0);
+        $poolConfig = $serverState['octaneConfig']['swoole']['pool'] ?? [];
+        $waitTimeout = $poolConfig['wait_timeout'] ?? 30.0;
+        $rejectOnFull = $poolConfig['reject_on_full'] ?? false;
+        $overloadStatus = $poolConfig['overload_status'] ?? 503;
+        $retryAfter = $poolConfig['overload_retry_after'] ?? 5;
+
+        if (!is_numeric($waitTimeout)) {
+            $waitTimeout = 30.0;
+        }
+
+        $waitTimeout = (float) $waitTimeout;
+        $popTimeout = ($rejectOnFull || $waitTimeout <= 0) ? 0.001 : $waitTimeout;
+
+        $worker = $workerState->clientPool->pop($popTimeout);
         
         if ($worker === false) {
             $errCode = $workerState->clientPool->errCode;
             error_log("❌ Pool pop failed! ErrCode: {$errCode}, Stats: " . json_encode($workerState->clientPool->stats()));
             
             // Timeout occurred - pool is exhausted and queue is full/slow
-            $response->status(503);
+            $response->status((int) $overloadStatus);
             $response->header('Content-Type', 'application/json');
-            $response->header('Retry-After', '5');
+            if (is_numeric($retryAfter) && (int) $retryAfter > 0) {
+                $response->header('Retry-After', (string) $retryAfter);
+            }
             $response->end(json_encode([
                 'error' => 'Service Unavailable',
                 'message' => 'Server is too busy, please try again later',

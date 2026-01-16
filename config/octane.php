@@ -188,6 +188,11 @@ return [
             'size' => env('OCTANE_POOL_SIZE', 50),
             'min_size' => env('OCTANE_POOL_MIN_SIZE', 1),
             'max_size' => env('OCTANE_POOL_MAX_SIZE', 1000),
+            'wait_timeout' => env('OCTANE_POOL_WAIT_TIMEOUT', 30.0),
+            'reject_on_full' => env('OCTANE_POOL_REJECT_ON_FULL', false),
+            'overload_status' => env('OCTANE_POOL_OVERLOAD_STATUS', 503),
+            'overload_retry_after' => env('OCTANE_POOL_OVERLOAD_RETRY_AFTER', 5),
+            'db_max_connections_buffer' => env('OCTANE_POOL_DB_MAX_CONNECTIONS_BUFFER', 10),
         ],
 
         /*
@@ -258,6 +263,19 @@ return [
     */
 
     'garbage' => 50,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Max Timer Table Size
+    |--------------------------------------------------------------------------
+    |
+    | When max_execution_time is enabled, Octane stores per-request timing
+    | data in a Swoole table. This controls that table's row count. Set to
+    | null to let Octane auto-calculate based on pool size and worker count.
+    |
+    */
+
+    'max_timer_table_size' => env('OCTANE_MAX_TIMER_TABLE_SIZE', null),
 
     /*
     |--------------------------------------------------------------------------

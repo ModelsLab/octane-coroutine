@@ -9,6 +9,8 @@
 [![Laravel](https://img.shields.io/badge/laravel-%5E10%7C%5E11%7C%5E12-FF2D20.svg)](https://laravel.com)
 [![Swoole](https://img.shields.io/badge/swoole-required-00ADD8.svg)](https://www.swoole.co.uk)
 
+> Requires the latest Swoole with coroutine hooks enabled. Older versions are not supported.
+
 ## 🚀 What is this?
 
 This is an **enhanced fork** of Laravel Octane that adds **true Swoole coroutine support**, enabling your Laravel application to handle thousands of concurrent requests efficiently through non-blocking I/O.
@@ -128,6 +130,34 @@ Edit `config/octane.php` if needed:
 ],
 ```
 
+### Redis & Database Coroutine Safety
+
+Coroutine mode relies on coroutine-safe IO drivers and connection handling.
+Recommended defaults:
+
+```env
+# Redis
+REDIS_CLIENT=phpredis
+REDIS_PERSISTENT=true
+
+# Database (disable PDO persistent connections in coroutine mode)
+DB_PERSISTENT=false
+
+# Pool sizing (keep min low to avoid exhausting MySQL max_connections)
+DB_POOL_MIN=1
+DB_POOL_MAX=50
+```
+
+Notes:
+- **phpredis** is fastest, but persistence must be isolated per worker. This fork assigns a
+  unique `persistent_id` per pool worker to avoid socket sharing across coroutines.
+- **Predis** is not included by default. If you prefer a PHP-only client, install it
+  manually and disable persistence:
+  - `composer require predis/predis`
+  - `REDIS_CLIENT=predis`
+  - `REDIS_PERSISTENT=false`
+- **PDO persistent connections** can cause cross-coroutine contention; keep them off.
+
 ## 🏊 Understanding Workers, Pool, and Coroutines
 
 This section clarifies the key concepts that make this fork different from standard Octane.
@@ -198,6 +228,14 @@ Coroutines:  Worker yields → other requests continue
 
 - **Coroutines without Pool**: Fast but dangerous (state leaks between requests)
 - **Pool without Coroutines**: Safe but slow (one request at a time)
+
+## 🧪 Testing
+
+Unit tests require a PHP build with the Swoole extension installed.
+
+```bash
+php83 vendor/bin/phpunit --testsuite Unit
+```
 - **Both together**: Fast AND safe ✅
 
 ### Pool Configuration

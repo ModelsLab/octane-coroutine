@@ -51,17 +51,22 @@ class DatabasePool
     public function get()
     {
         $waitTimeout = $this->config['wait_timeout'] ?? 3.0;
+        $maxConnections = $this->config['max_connections'] ?? 10;
 
-        // Try to get from pool first
-        $connection = $this->channel->pop($waitTimeout);
+        // Fast path: try a non-blocking pop first to avoid unnecessary waits.
+        $connection = $this->channel->pop(0.001);
 
         if ($connection === false) {
-            // Channel is empty and timeout reached
-            // Try to create a new connection if under max limit
-            if ($this->currentConnections < ($this->config['max_connections'] ?? 10)) {
+            // If we can grow the pool, create immediately instead of waiting.
+            if ($this->currentConnections < $maxConnections) {
                 $connection = $this->createConnection();
             } else {
-                throw new \RuntimeException('Connection pool exhausted. Cannot establish new connection before wait_timeout.');
+                // Pool is at max; wait for a connection to be released.
+                $connection = $this->channel->pop($waitTimeout);
+
+                if ($connection === false) {
+                    throw new \RuntimeException('Connection pool exhausted. Cannot establish new connection before wait_timeout.');
+                }
             }
         }
 
