@@ -428,6 +428,10 @@ class OnWorkerStart
      */
     protected function streamRequestsToConsole($server)
     {
+        if (! $this->workerState->worker) {
+            return;
+        }
+
         $this->workerState->worker->onRequestHandled(function ($request, $response, $sandbox) {
             if (! $sandbox->environment('local', 'testing')) {
                 return;
