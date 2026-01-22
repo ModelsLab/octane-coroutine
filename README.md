@@ -1,6 +1,6 @@
 # Laravel Octane with Swoole Coroutine Support
 
-⚡ **High-performance Laravel** with true coroutine support for massive concurrency [Still in Development]
+⚡ **High-performance Laravel** with true coroutine support for massive concurrency
 
 [![Packagist Version](https://img.shields.io/packagist/v/modelslab/octane-coroutine.svg)](https://packagist.org/packages/modelslab/octane-coroutine)
 [![Packagist Downloads](https://img.shields.io/packagist/dt/modelslab/octane-coroutine.svg)](https://packagist.org/packages/modelslab/octane-coroutine)
@@ -74,9 +74,6 @@ composer require modelslab/octane-coroutine:^0.7
 # Install development version
 composer require modelslab/octane-coroutine:dev-main
 ```
-
-> [!WARNING]
-> **⚠️ Experimental Package**: This package is under **active development** with frequent updates and improvements. It is **not yet production-ready** and breaking changes may occur. Use at your own risk and thoroughly test in staging environments.
 
 ### Updating the Package
 
@@ -259,6 +256,24 @@ This fork adds a new `pool` configuration section to `config/octane.php`:
 ```
 
 **Note**: Standard Octane only has `worker_num`. The `pool` configuration is unique to this fork.
+
+You can also configure the pool via `.env`:
+
+```env
+OCTANE_POOL_SIZE=50
+OCTANE_POOL_MIN_SIZE=1
+OCTANE_POOL_MAX_SIZE=1000
+OCTANE_POOL_IDLE_TIMEOUT=10
+OCTANE_POOL_WAIT_TIMEOUT=30
+OCTANE_POOL_REJECT_ON_FULL=false
+OCTANE_POOL_OVERLOAD_STATUS=503
+OCTANE_POOL_OVERLOAD_RETRY_AFTER=5
+OCTANE_POOL_DB_MAX_CONNECTIONS_BUFFER=10
+```
+
+Notes:
+- `OCTANE_POOL_WAIT_TIMEOUT` controls how long a request can wait for a pooled app before an overload response is returned.
+- `OCTANE_POOL_REJECT_ON_FULL=true` disables queuing and immediately returns `OCTANE_POOL_OVERLOAD_STATUS`.
 
 ## ⚡ Performance Optimization
 
@@ -467,6 +482,7 @@ php artisan octane:start --server=swoole --workers=32 | grep "Worker"
 - **Memory**: Monitor usage and scale workers accordingly
 - **Warmup**: Workers initialize automatically; allow 5-10 seconds before heavy load
 - **State management**: Laravel's service container handles coroutine isolation automatically
+- **Proxy timeouts**: If you're behind Nginx/ALB, set upstream read timeouts above your max request time plus any expected queueing
 
 ## 📈 Scaling Guide
 
