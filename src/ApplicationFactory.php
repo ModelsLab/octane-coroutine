@@ -8,6 +8,7 @@ use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Bootstrap\RegisterProviders;
 use Illuminate\Foundation\Bootstrap\SetRequestForConsole;
 use Illuminate\Support\Facades\Facade;
+use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
 use ReflectionObject;
 use RuntimeException;
 
@@ -31,6 +32,7 @@ class ApplicationFactory
             if (file_exists($path)) {
                 $inCoroutine = class_exists(\Swoole\Coroutine::class) && \Swoole\Coroutine::getCid() > 0;
                 $previousContainer = null;
+                $bootstrapContainer = null;
                 $previousContextApp = null;
                 $previousCurrentApp = null;
                 $previousFacadeApp = null;
@@ -39,6 +41,7 @@ class ApplicationFactory
 
                 if ($inCoroutine) {
                     $previousContainer = Container::getInstance();
+                    $bootstrapContainer = $previousContainer;
                     $previousFacadeApp = Facade::getFacadeApplication();
                     $hadContextApp = \Laravel\Octane\Swoole\Coroutine\Context::has('octane.app');
                     $previousContextApp = $hadContextApp
@@ -55,7 +58,11 @@ class ApplicationFactory
                 if ($inCoroutine) {
                     // Restore the coroutine proxy as the global container and
                     // point the current coroutine at the app being bootstrapped.
-                    Container::setInstance($previousContainer);
+                    if (! $bootstrapContainer instanceof Application) {
+                        $bootstrapContainer = new CoroutineApplication($app);
+                    }
+
+                    Container::setInstance($bootstrapContainer);
                     \Laravel\Octane\Swoole\Coroutine\Context::set('octane.app', $app);
                     \Laravel\Octane\Swoole\Coroutine\Context::set('octane.current_app', $app);
                 }
