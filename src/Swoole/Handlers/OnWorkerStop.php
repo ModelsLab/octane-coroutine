@@ -10,11 +10,7 @@ use Swoole\Coroutine;
  * OnWorkerStop Handler
  *
  * Handles graceful worker shutdown, ensuring in-flight coroutines
- * complete before the worker exits. Inspired by Hyperf's graceful
- * shutdown pattern.
- *
- * FIX (Bug #9): Now tracks only Octane request coroutines, not Swoole
- * internal coroutines, to prevent false positives during shutdown.
+ * complete before the worker exits.
  */
 class OnWorkerStop
 {
@@ -49,8 +45,6 @@ class OnWorkerStop
         // Signal that worker is exiting - allows in-flight coroutines to check
         CoordinatorManager::until(CoordinatorManager::WORKER_EXIT)->resume();
 
-        // FIX (Bug #9): Use tracked request coroutines instead of total Swoole coroutines
-        // This avoids waiting on internal Swoole coroutines/timers that keep the count > 1
         $initialRequests = Monitor::getActiveRequestCount();
 
         if ($initialRequests > 0) {

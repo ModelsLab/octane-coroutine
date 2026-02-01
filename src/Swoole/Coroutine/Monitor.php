@@ -9,10 +9,6 @@ use Swoole\Table;
  * Coroutine Monitor
  *
  * Provides monitoring and debugging utilities for coroutines.
- * Inspired by Hyperf's monitoring capabilities for production debugging.
- *
- * FIX (Bug #9): Added tracking for Octane request coroutines specifically,
- * separate from Swoole's internal coroutines.
  */
 class Monitor
 {
@@ -104,7 +100,7 @@ class Monitor
         return [
             'enabled' => true,
             'active_coroutines' => $stats['coroutine_num'] ?? 0,
-            'active_requests' => static::getActiveRequestCount(), // FIX (Bug #9)
+            'active_requests' => static::getActiveRequestCount(),
             'peak_coroutines' => $stats['coroutine_peak_num'] ?? 0,
             'event_count' => $stats['event_num'] ?? 0,
             'signal_count' => $stats['signal_listener_num'] ?? 0,

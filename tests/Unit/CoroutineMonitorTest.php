@@ -7,7 +7,6 @@ use Laravel\Octane\Swoole\Coroutine\Monitor;
 
 /**
  * Tests for the coroutine Monitor class.
- * Bug #9: Ensures proper tracking of request coroutines for graceful shutdown.
  */
 class CoroutineMonitorTest extends TestCase
 {

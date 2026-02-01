@@ -4,10 +4,8 @@ namespace Laravel\Octane\Swoole\Coroutine;
 
 /**
  * Coordinator Manager
- * 
+ *
  * Manages multiple coordinators for different lifecycle events.
- * Inspired by Hyperf's CoordinatorManager for production-grade
- * worker lifecycle management.
  */
 class CoordinatorManager
 {

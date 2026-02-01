@@ -8,10 +8,7 @@ use Illuminate\Database\Connection;
 use Throwable;
 
 /**
- * Custom Connection Pool for Laravel
- *
- * Inspired by Hyperf's Pool architecture but designed for Laravel compatibility.
- * Uses Swoole Channels for coroutine-safe connection pooling.
+ * Connection pool for Laravel using Swoole Channels for coroutine-safe pooling.
  */
 class DatabasePool
 {
@@ -80,8 +77,6 @@ class DatabasePool
 
     /**
      * Release a connection back to the pool
-     *
-     * FIX (Bug #5 & #6): Reset connection state and use timeout on push
      */
     public function release($connection): void
     {
@@ -90,11 +85,8 @@ class DatabasePool
         }
 
         try {
-            // FIX (Bug #5): Reset connection state before returning to pool
             $this->resetConnection($connection);
 
-            // FIX (Bug #6): Use timeout on push to prevent blocking
-            // If push fails (channel full or timeout), close the connection
             $pushTimeout = $this->config['release_timeout'] ?? 1.0;
             $pushed = $this->channel->push($connection, $pushTimeout);
 
@@ -113,8 +105,6 @@ class DatabasePool
 
     /**
      * Reset connection state to prevent state leaks between requests.
-     *
-     * FIX (Bug #5): Ensures no transaction or session state carries over.
      */
     protected function resetConnection($connection): void
     {

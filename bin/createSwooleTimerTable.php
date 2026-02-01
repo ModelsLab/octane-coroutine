@@ -6,9 +6,6 @@ use Swoole\Table;
 require_once __DIR__.'/../src/Tables/TableFactory.php';
 
 if (($serverState['octaneConfig']['max_execution_time'] ?? 0) > 0) {
-    // FIX (Bug #4): Increased default from 250 to a more appropriate value
-    // The timer table needs to hold one entry per concurrent coroutine across all workers
-    // Formula: pool_size * worker_num (with safety margin)
     $poolSize = $serverState['octaneConfig']['swoole']['pool']['size'] ?? 10;
     $workerNum = $serverState['octaneConfig']['swoole']['options']['worker_num'] ?? 4;
 

@@ -11,9 +11,6 @@ use Swoole\Coroutine;
 /**
  * Coroutine-safe application context manager.
  *
- * FIX (Bug #7): Uses the same Context class as the rest of the coroutine code.
- * Previously used Hyperf's ApplicationContext which caused inconsistency.
- *
  * This class manages the current application instance in a coroutine-safe way,
  * ensuring each coroutine gets its own isolated sandbox application.
  */

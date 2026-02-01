@@ -120,8 +120,7 @@ $server->on('workerstart', fn (Server $server, $workerId) =>
 */
 
 $server->on('request', function ($request, $response) use ($server, $workerState, $serverState) {
-    // FIX (Bug #8): Store request start time in coroutine context, not global state
-    // This prevents metrics corruption when multiple concurrent requests run
+    // Store request start time in coroutine context for per-request metrics.
     $requestStartTime = microtime(true);
 
     // Wait for worker to be fully initialized
@@ -186,13 +185,11 @@ $server->on('request', function ($request, $response) use ($server, $workerState
     $context = Coroutine::getContext();
     $context['worker'] = $worker;
     $context['worker_id'] = $workerState->workerId;
-    $context['request_start_time'] = $requestStartTime; // FIX (Bug #8)
+    $context['request_start_time'] = $requestStartTime;
 
-    // FIX (Bug #9): Register this coroutine as handling a request
     Monitor::registerRequestCoroutine($cid);
 
     if ($workerState->timerTable) {
-        // FIX (Bug #4): Add error handling for timer table set operation
         $cid = Coroutine::getCid();
         $setResult = $workerState->timerTable->set($cid, [
             'worker_pid' => $workerState->workerPid,
@@ -213,8 +210,7 @@ $server->on('request', function ($request, $response) use ($server, $workerState
             'octaneConfig' => $serverState['octaneConfig'],
         ])));
     } catch (\Throwable $e) {
-        // CRITICAL FIX: Catch all exceptions to prevent worker crashes
-        // Log the error and send a 500 response instead of crashing
+        // Catch all exceptions to prevent worker crashes — log and send 500 instead.
         error_log("❌ CRITICAL ERROR in Worker #{$workerState->workerId} (Coroutine #" . Coroutine::getCid() . "): " . $e->getMessage());
         error_log("   File: {$e->getFile()}:{$e->getLine()}");
         
@@ -246,10 +242,9 @@ $server->on('request', function ($request, $response) use ($server, $workerState
             $workerState->timerTable->del($cid);
         }
 
-        // FIX (Bug #9): Unregister this request coroutine
         Monitor::unregisterRequestCoroutine($cid);
 
-        // CRITICAL FIX: Return worker to the pool!
+        // Return worker to the pool so it remains available for subsequent requests.
         if ($workerState->workerPool && $worker) {
             try {
                 $kept = $workerState->workerPool->release($worker);

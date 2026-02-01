@@ -56,8 +56,6 @@ class EnsureRequestsDontExceedMaxExecutionTime
             // Log the timeout
             error_log("⏱️ Request timeout: Coroutine #{$coroutineId} exceeded {$this->maxExecutionTime}s max execution time");
 
-            // FIX (Bug #3): Try to cancel only the specific coroutine first
-            // This preserves other concurrent requests on the same worker
             $cancelled = $this->cancelCoroutine($coroutineId);
 
             if (!$cancelled) {

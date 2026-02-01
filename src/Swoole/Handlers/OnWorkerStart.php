@@ -200,9 +200,7 @@ class OnWorkerStart
         $coroutineApp = new CoroutineApplication($baseApp);
         Container::setInstance($coroutineApp);
 
-        // CRITICAL FIX (Bug #1): Facades MUST use the coroutine-aware proxy
-        // Without this, Facades resolve from the base app and cache globally,
-        // causing state leaks like "Target class [config] does not exist"
+        // Facades must use the coroutine-aware proxy to avoid state leaks between concurrent requests.
         Facade::clearResolvedInstances();
         Facade::setFacadeApplication($coroutineApp);
         FacadeCache::disable();
@@ -235,10 +233,9 @@ class OnWorkerStart
      */
     public function createPoolWorker(Server $server, int $workerId, int $poolIndex): Worker
     {
-        // NOTE: Do NOT clear Facade::clearResolvedInstances() or Context::clear() here!
-        // This method can be called during dynamic pool growth (while requests are running),
-        // and clearing global state would break those running requests.
-        // Each Worker has its own isolated Application instance anyway.
+        // Do not clear Facade instances or Context here — this method is called during
+        // dynamic pool growth while requests may be running, and clearing global state
+        // would break those in-flight requests.
 
         $worker = new Worker(
             new ApplicationFactory($this->basePath),
@@ -437,8 +434,7 @@ class OnWorkerStart
                 return;
             }
 
-            // FIX (Bug #8): Get request start time from coroutine context
-            // instead of global workerState to prevent metrics corruption
+            // Get request start time from coroutine context to avoid metrics corruption across concurrent requests.
             $requestStartTime = null;
             $cid = \Swoole\Coroutine::getCid();
             if ($cid > 0) {

@@ -7,7 +7,6 @@ use Laravel\Octane\Swoole\Coroutine\Context;
 
 /**
  * Tests for the coroutine Context class.
- * Bug #7: Ensures context isolation works correctly.
  */
 class CoroutineContextTest extends TestCase
 {

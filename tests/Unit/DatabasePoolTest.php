@@ -12,11 +12,9 @@ use ReflectionMethod;
 
 /**
  * Tests for the DatabasePool class.
- * Bug #5: Transaction state reset before release.
- * Bug #6: Timeout on channel push to prevent blocking.
  *
- * Note: These tests mock the dependencies since we can't run Swoole
- * in the PHPUnit environment directly.
+ * These tests mock the dependencies since Swoole
+ * is not available in the PHPUnit environment directly.
  */
 class DatabasePoolTest extends TestCase
 {

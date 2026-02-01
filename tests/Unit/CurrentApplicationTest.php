@@ -10,7 +10,6 @@ use Mockery;
 
 /**
  * Tests for the CurrentApplication class.
- * Bug #7: Ensures consistent context usage across the codebase.
  */
 class CurrentApplicationTest extends TestCase
 {

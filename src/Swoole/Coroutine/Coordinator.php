@@ -6,10 +6,9 @@ use Swoole\Coroutine\Channel;
 
 /**
  * Coroutine Coordinator
- * 
- * Inspired by Hyperf's Coordinator pattern for managing coroutine lifecycle
- * and enabling graceful shutdown. Allows coroutines to wait for specific
- * events before proceeding.
+ *
+ * Manages coroutine lifecycle and enables graceful shutdown.
+ * Allows coroutines to wait for specific events before proceeding.
  */
 class Coordinator
 {

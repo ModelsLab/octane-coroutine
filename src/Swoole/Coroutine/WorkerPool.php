@@ -127,12 +127,7 @@ class WorkerPool
         $available = $this->channel->length();
         $now = microtime(true);
 
-        // NOTE: We do NOT shrink at release time anymore.
-        // Instead, we always return the worker to the pool.
-        // Shrinking based on idle time should happen when workers are ACQUIRED
-        // after sitting idle in the pool for too long.
-        // For now, we just maintain the pool size without aggressive shrinking.
-
+        // Shrinking idle workers happens at acquire time, not release time.
         if (isset($this->metadata[$workerId])) {
             $this->metadata[$workerId]['last_used_at'] = $now;
             unset($this->metadata[$workerId]['last_acquired_at']);
