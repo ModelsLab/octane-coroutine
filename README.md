@@ -69,7 +69,7 @@ php artisan octane:install swoole
 
 ```bash
 # Install latest stable
-composer require modelslab/octane-coroutine:^0.7
+composer require modelslab/octane-coroutine:^0.8.6
 
 # Install development version
 composer require modelslab/octane-coroutine:dev-main
@@ -92,7 +92,7 @@ php artisan octane:reload
 ```json
 {
     "require": {
-        "modelslab/octane-coroutine": "^0.7.7"
+        "modelslab/octane-coroutine": "^0.8.6"
     }
 }
 ```
@@ -135,27 +135,27 @@ Recommended defaults:
 ```env
 # Redis
 REDIS_CLIENT=phpredis
-REDIS_PERSISTENT=true
 
 # Database (disable PDO persistent connections in coroutine mode)
 DB_PERSISTENT=false
 
-# Pool sizing (keep min low to avoid exhausting MySQL max_connections)
-DB_POOL_MIN=1
-DB_POOL_MAX=50
+# Optional startup warning buffer for DB min_connections planning
+OCTANE_POOL_DB_MAX_CONNECTIONS_BUFFER=10
 ```
 
 Notes:
-- **phpredis** is fastest, but persistence must be isolated per worker. This fork assigns a
-  unique `persistent_id` per pool worker to avoid socket sharing across coroutines.
+- **phpredis** is fastest. This fork rewrites Redis handling for coroutine safety so
+  request-scoped Redis managers do not reuse process-shared persistent sockets.
 - **Predis** is not included by default. If you prefer a PHP-only client, install it
   manually and disable persistence:
   - `composer require predis/predis`
   - `REDIS_CLIENT=predis`
   - `REDIS_PERSISTENT=false`
 - **PDO persistent connections** can cause cross-coroutine contention; keep them off.
+- Database connection pooling in `config/database.php` is separate from the HTTP runtime.
+  The only `octane.swoole.pool` setting still used is the DB warning buffer above.
 
-## 🏊 Understanding Workers, Pool, and Coroutines
+## 🏊 Understanding Workers and Coroutines
 
 This section clarifies the key concepts that make this fork different from standard Octane.
 
@@ -169,19 +169,6 @@ This section clarifies the key concepts that make this fork different from stand
 ```
 Standard Octane: 1 Worker = 1 Request at a time (blocking)
 ```
-
-### What is the Application Pool?
-
-The **Pool** is a collection of pre-initialized Laravel Application instances within each worker. This fork introduces pooling to solve state isolation:
-
-```
-This Fork: 1 Worker = 1 Pool of N Application instances
-```
-
-When a coroutine needs to handle a request, it borrows an Application from the pool, uses it, then returns it. This ensures:
-- **State Isolation**: Each concurrent request gets its own Application instance
-- **No State Leakage**: Request A's data never bleeds into Request B
-- **Memory Efficiency**: Applications are reused, not created per-request
 
 ### What are Coroutines?
 
@@ -200,31 +187,27 @@ Coroutines:  Worker yields → other requests continue
 ├─────────────────────────────────────────────────────────────┤
 │  Worker 0                      Worker 1                     │
 │  ┌─────────────────────┐       ┌─────────────────────────┐  │
-│  │ Pool (10 Apps)      │       │ Pool (10 Apps)          │  │
-│  │ ┌───┐┌───┐┌───┐     │       │ ┌───┐┌───┐┌───┐        │  │
-│  │ │App││App││App│ ... │       │ │App││App││App│ ...    │  │
-│  │ └───┘└───┘└───┘     │       │ └───┘└───┘└───┘        │  │
+│  │ Shared Laravel      │       │ Shared Laravel          │  │
+│  │ worker runtime      │       │ worker runtime          │  │
 │  │                     │       │                         │  │
 │  │ Coroutines:         │       │ Coroutines:             │  │
-│  │ cid:1 → App[0]      │       │ cid:1 → App[0]          │  │
-│  │ cid:2 → App[1]      │       │ cid:2 → App[1]          │  │
-│  │ cid:3 → App[2]      │       │ cid:3 → App[2]          │  │
+│  │ cid:1 → scope A     │       │ cid:1 → scope A         │  │
+│  │ cid:2 → scope B     │       │ cid:2 → scope B         │  │
+│  │ cid:3 → scope C     │       │ cid:3 → scope C         │  │
 │  │ ...                 │       │ ...                     │  │
 │  └─────────────────────┘       └─────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Are Coroutines and Pool the Same?
+### How Request Isolation Works
 
-**No!** They solve different problems:
+This runtime does **not** use an HTTP application pool anymore. Each Swoole worker
+boots one shared Laravel worker runtime, and concurrent requests are isolated by
+the coroutine-aware container proxy plus per-request scoped state for bindings
+such as request, session, router, view, log, cache, and Redis managers.
 
-| Concept | What It Does | Solves |
-|---------|--------------|--------|
-| **Coroutines** | Non-blocking I/O, concurrent execution | Performance (throughput) |
-| **Pool** | Pre-initialized Application instances | State isolation (correctness) |
-
-- **Coroutines without Pool**: Fast but dangerous (state leaks between requests)
-- **Pool without Coroutines**: Safe but slow (one request at a time)
+The legacy `octane.swoole.pool` config namespace remains only for
+`db_max_connections_buffer`, which is used by a startup safety warning.
 
 ## 🧪 Testing
 
@@ -233,47 +216,25 @@ Unit tests require a PHP build with the Swoole extension installed.
 ```bash
 php83 vendor/bin/phpunit --testsuite Unit
 ```
-- **Both together**: Fast AND safe ✅
 
-### Pool Configuration
+### Coroutine Runtime Configuration
 
-This fork adds a new `pool` configuration section to `config/octane.php`:
+The package is pool-free for HTTP workers. The relevant Swoole config looks like:
 
 ```php
 'swoole' => [
     'options' => [
-        'worker_num' => 8,  // OS processes (CLI: --workers=8)
+        'worker_num' => 8,
     ],
 
-    // NEW: Application pool per worker
     'pool' => [
-        'size' => 100,      // Applications per worker
-        'min_size' => 1,    // Minimum pool size
-        'max_size' => 1000, // Maximum pool size
-        'idle_timeout' => 10, // Seconds before trimming idle workers
+        'db_max_connections_buffer' => env('OCTANE_POOL_DB_MAX_CONNECTIONS_BUFFER', 10),
     ],
 ],
 ```
 
-**Note**: Standard Octane only has `worker_num`. The `pool` configuration is unique to this fork.
-
-You can also configure the pool via `.env`:
-
-```env
-OCTANE_POOL_SIZE=50
-OCTANE_POOL_MIN_SIZE=1
-OCTANE_POOL_MAX_SIZE=1000
-OCTANE_POOL_IDLE_TIMEOUT=10
-OCTANE_POOL_WAIT_TIMEOUT=30
-OCTANE_POOL_REJECT_ON_FULL=false
-OCTANE_POOL_OVERLOAD_STATUS=503
-OCTANE_POOL_OVERLOAD_RETRY_AFTER=5
-OCTANE_POOL_DB_MAX_CONNECTIONS_BUFFER=10
-```
-
-Notes:
-- `OCTANE_POOL_WAIT_TIMEOUT` controls how long a request can wait for a pooled app before an overload response is returned.
-- `OCTANE_POOL_REJECT_ON_FULL=true` disables queuing and immediately returns `OCTANE_POOL_OVERLOAD_STATUS`.
+`OCTANE_POOL_DB_MAX_CONNECTIONS_BUFFER` only affects the startup warning that
+checks MySQL `max_connections` against your configured database pool minimums.
 
 ## ⚡ Performance Optimization
 
@@ -422,9 +383,10 @@ tail -f storage/logs/swoole_http.log | grep "Worker"
 
 Monitor your application:
 
-- **503 rate**: Should be <1% in production (indicates capacity issues)
+- **5xx rate**: Watch for upstream or worker errors under load
 - **Memory usage**: ~50-200MB per worker depending on application
 - **Worker count**: Scale based on CPU cores (typically 1-2× CPU count)
+- **Worker restarts**: Unexpected churn usually means a fatal error or memory issue
 
 ## 🛠️ Production Recommendations
 
@@ -482,31 +444,27 @@ php artisan octane:start --server=swoole --workers=32 | grep "Worker"
 - **Memory**: Monitor usage and scale workers accordingly
 - **Warmup**: Workers initialize automatically; allow 5-10 seconds before heavy load
 - **State management**: Laravel's service container handles coroutine isolation automatically
-- **Proxy timeouts**: If you're behind Nginx/ALB, set upstream read timeouts above your max request time plus any expected queueing
+- **Proxy timeouts**: If you're behind Nginx/ALB, set upstream read timeouts above your max request time
 
 ## 📈 Scaling Guide
 
 ### Small (Development)
 - Workers: 4-8
-- Pool Size: 10-20
 - Handles: ~500 concurrent requests
 - RAM: 2-4GB
 
 ### Medium (Production)
 - Workers: 16-32
-- Pool Size: 50-100
 - Handles: ~2,000 concurrent requests
 - RAM: 4-8GB
 
 ### Large (High-Traffic)
 - Workers: 32-64
-- Pool Size: 100-200
 - Handles: ~5,000 concurrent requests
 - RAM: 8-16GB
 
 ### XL (Enterprise)
 - Workers: 64-128
-- Pool Size: 200-500
 - Handles: ~10,000+ concurrent requests
 - RAM: 16-32GB
 
@@ -517,12 +475,11 @@ This section provides specific, tested recommendations for achieving **10,000 re
 ### Understanding the Math
 
 ```
-Total Concurrent Capacity = Workers × Pool Size × Coroutine Efficiency
-
 For 10K req/sec with 100ms average response time:
 - Concurrent requests needed: 10,000 × 0.1 = 1,000 concurrent
 - With 8 workers, each needs: 1,000 ÷ 8 = 125 concurrent per worker
-- Pool size recommendation: 150-200 (with buffer)
+- There is no HTTP app pool cap; the real limits are memory, upstream capacity,
+  and whether your request path actually yields on blocking I/O.
 ```
 
 ### Recommended Configuration
@@ -537,13 +494,6 @@ For 10K req/sec with 100ms average response time:
         'backlog' => 8192,              // Connection queue size
         'socket_buffer_size' => 2097152, // 2MB socket buffer
         'buffer_output_size' => 2097152, // 2MB output buffer
-    ],
-
-    'pool' => [
-        'size' => 200,                  // 200 apps per worker = 1,600 total capacity
-        'min_size' => 10,
-        'max_size' => 500,
-        'idle_timeout' => 10,
     ],
 ],
 ```
@@ -571,20 +521,17 @@ php artisan octane:start \
 ### Memory Calculation
 
 ```
-Memory per Worker ≈ Base (50MB) + (Pool Size × App Memory)
-Memory per App ≈ 10-30MB (depends on your application)
+Memory ≈ worker count × base worker footprint + in-flight request state
 
-Example with pool size 200:
-- Per worker: 50MB + (200 × 15MB) = ~3GB
-- 8 workers: 8 × 3GB = ~24GB peak
-
-Note: This is peak memory. Actual usage is lower as apps share memory.
-Realistic: 8-12GB for 8 workers with pool size 200
+Measure this under real load in your application. Pool-free coroutine mode is
+dramatically lighter than pre-booting many application instances per worker, but
+the exact number still depends on your middleware, services, and payload sizes.
 ```
 
 ### Database Connection Pooling
 
-**Critical**: With 8 workers × 200 pool size, you could have up to 1,600 concurrent database connections!
+Database pooling is separate from the HTTP runtime. Size it from worker count and
+your configured per-connection pool minimums and maximums.
 
 ```php
 // config/database.php
@@ -593,12 +540,16 @@ Realistic: 8-12GB for 8 workers with pool size 200
     // ... other config
     'pool' => [
         'min_connections' => 1,
-        'max_connections' => 50,  // Per worker: 8 × 50 = 400 max connections
+        'max_connections' => 50,
         'connect_timeout' => 10.0,
         'wait_timeout' => 3.0,
     ],
 ],
 ```
+
+For example, `8 workers × min_connections=1` means at least `8` DB connections
+before real traffic. `OCTANE_POOL_DB_MAX_CONNECTIONS_BUFFER` only adjusts the
+startup warning threshold for this planning.
 
 Or configure MySQL server:
 ```sql
@@ -648,23 +599,11 @@ With the above configuration on 8-core CPU:
 
 ### Tuning Tips
 
-1. **Start Conservative**: Begin with pool size 50, increase gradually while monitoring memory
-2. **Monitor Actively**: Watch for pool exhaustion (503 errors) and memory growth
+1. **Start Conservative**: Begin with a modest worker count and measure under load
+2. **Monitor Actively**: Watch memory, 5xx rates, worker restarts, and upstream saturation
 3. **Warm Up**: Allow 30-60 seconds for workers to warm up before heavy traffic
 4. **Use Redis**: Offload sessions and cache to Redis for better concurrency
-5. **Connection Pooling**: Use database connection pooling to prevent connection exhaustion
-
-### Comparison: Workers vs Pool Scaling
-
-| Strategy | Config | Capacity | Memory | Best For |
-|----------|--------|----------|--------|----------|
-| More Workers | 16 workers × 50 pool | 800 concurrent | ~8GB | CPU-bound work |
-| Larger Pool | 8 workers × 200 pool | 1,600 concurrent | ~10GB | I/O-bound work |
-| Balanced | 12 workers × 100 pool | 1,200 concurrent | ~9GB | Mixed workloads |
-
-**Rule of Thumb**:
-- **I/O-heavy apps** (APIs, database): Fewer workers, larger pool
-- **CPU-heavy apps** (processing): More workers, smaller pool
+5. **Size Database Pools Separately**: Prevent DB connection exhaustion independently of HTTP concurrency
 
 ## 📚 Resources
 
