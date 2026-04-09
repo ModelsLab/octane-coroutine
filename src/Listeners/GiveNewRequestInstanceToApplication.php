@@ -2,6 +2,9 @@
 
 namespace Laravel\Octane\Listeners;
 
+use Laravel\Octane\Swoole\Coroutine\Context;
+use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
+
 class GiveNewRequestInstanceToApplication
 {
     /**
@@ -11,7 +14,12 @@ class GiveNewRequestInstanceToApplication
      */
     public function handle($event): void
     {
-        $event->app->instance('request', $event->request);
         $event->sandbox->instance('request', $event->request);
+
+        if (Context::inCoroutine() || $event->sandbox instanceof CoroutineApplication) {
+            return;
+        }
+
+        $event->app->instance('request', $event->request);
     }
 }

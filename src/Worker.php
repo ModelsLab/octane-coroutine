@@ -3,6 +3,7 @@
 namespace Laravel\Octane;
 
 use Closure;
+use Illuminate\Container\Container;
 use Illuminate\Foundation\Application;
 use Illuminate\Http\Request;
 use Laravel\Octane\Contracts\Client;
@@ -20,6 +21,8 @@ use Laravel\Octane\Swoole\TaskResult;
 use RuntimeException;
 use Throwable;
 use Laravel\Octane\Swoole\Coroutine\Context;
+use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
+use Laravel\Octane\Swoole\Coroutine\RequestScope;
 use Swoole\Coroutine;
 use Illuminate\Support\Facades\Facade;
 
@@ -76,16 +79,27 @@ class Worker implements WorkerContract
         // not cached instances from previous requests that hold stale container references.
         Facade::clearResolvedInstances();
 
-        // We will clone the application instance so that we have a clean copy to switch
-        // back to once the request has been handled. This allows us to easily delete
-        // certain instances that got resolved / mutated during a previous request.
-        $sandbox = clone $this->app;
+        $scope = null;
+        $sandbox = null;
+        $inCoroutine = class_exists(Context::class) && Coroutine::getCid() > 0;
 
-        // In coroutine mode, we store the sandbox in the coroutine context.
-        // The global Container instance is a proxy that delegates to this context.
-        if (class_exists(Context::class) && Coroutine::getCid() > 0) {
-            Context::set('octane.app', $sandbox);
+        if ($inCoroutine) {
+            $scope = new RequestScope($this->app, $request);
+            Context::set('octane.request_scope', $scope);
+
+            $sandbox = Container::getInstance();
+
+            if (! $sandbox instanceof Application) {
+                $sandbox = new CoroutineApplication($this->app);
+                Container::setInstance($sandbox);
+            }
+
+            Facade::setFacadeApplication($sandbox);
         } else {
+            // We will clone the application instance so that we have a clean copy to switch
+            // back to once the request has been handled. This allows us to easily delete
+            // certain instances that got resolved / mutated during a previous request.
+            $sandbox = clone $this->app;
             CurrentApplication::set($sandbox);
         }
 
@@ -125,7 +139,7 @@ class Worker implements WorkerContract
             $this->app->make('view.engine.resolver')->forget('blade');
             $this->app->make('view.engine.resolver')->forget('php');
 
-            if (class_exists(Context::class) && Coroutine::getCid() > 0) {
+            if ($inCoroutine) {
                 // Release database connections
                 if ($sandbox->bound('db')) {
                     $db = $sandbox->make('db');
@@ -142,7 +156,7 @@ class Worker implements WorkerContract
             // After the request handling process has completed we will unset some variables
             // plus reset the current application state back to its original state before
             // it was cloned. Then we will be ready for the next worker iteration loop.
-            unset($gateway, $sandbox, $context, $request, $response, $octaneResponse, $output);
+            unset($gateway, $sandbox, $scope, $context, $request, $response, $octaneResponse, $output);
         }
     }
 

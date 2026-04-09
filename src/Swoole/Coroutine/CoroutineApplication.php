@@ -52,13 +52,62 @@ class CoroutineApplication extends Application
         if (Coroutine::getCid() > 0) {
             $app = Context::get('octane.app');
 
-            if ($app) {
+            if ($app && $app !== $this) {
                 return $app;
             }
         }
 
         // Fallback to the base application (e.g., during boot or outside coroutines)
         return $this->baseApp;
+    }
+
+    /**
+     * Get the current coroutine request scope if one exists.
+     */
+    protected function getRequestScope(): ?RequestScope
+    {
+        $scope = Context::get('octane.request_scope');
+
+        return $scope instanceof RequestScope ? $scope : null;
+    }
+
+    /**
+     * Normalize an abstract using the base application's alias table.
+     *
+     * @param  mixed  $abstract
+     * @return mixed
+     */
+    protected function normalizeAbstract($abstract)
+    {
+        if (! is_string($abstract)) {
+            return $abstract;
+        }
+
+        return $this->baseApp->getAlias($abstract);
+    }
+
+    /**
+     * Determine if the given abstract has a coroutine-scoped instance.
+     *
+     * @param  mixed  $abstract
+     */
+    protected function hasScopedInstance($abstract): bool
+    {
+        $scope = $this->getRequestScope();
+
+        return $scope instanceof RequestScope
+            && is_string($abstract = $this->normalizeAbstract($abstract))
+            && $scope->has($abstract);
+    }
+
+    /**
+     * Determine if the given abstract should resolve to the proxy itself.
+     *
+     * @param  mixed  $abstract
+     */
+    protected function resolvesToProxy($abstract): bool
+    {
+        return is_string($abstract) && $this->normalizeAbstract($abstract) === 'app';
     }
 
     /**
@@ -84,6 +133,24 @@ class CoroutineApplication extends Application
      */
     public function make($abstract, array $parameters = [])
     {
+        if ($this->resolvesToProxy($abstract)) {
+            return $this;
+        }
+
+        $scope = $this->getRequestScope();
+
+        if ($scope instanceof RequestScope && is_string($abstract = $this->normalizeAbstract($abstract))) {
+            if ($scope->has($abstract)) {
+                return $scope->get($abstract);
+            }
+
+            $resolved = $scope->resolve($abstract, $this);
+
+            if ($scope->has($abstract)) {
+                return $resolved;
+            }
+        }
+
         return $this->getCurrentApp()->make($abstract, $parameters);
     }
 
@@ -95,6 +162,10 @@ class CoroutineApplication extends Application
      */
     public function bound($abstract)
     {
+        if ($this->resolvesToProxy($abstract) || $this->hasScopedInstance($abstract)) {
+            return true;
+        }
+
         return $this->getCurrentApp()->bound($abstract);
     }
 
@@ -106,6 +177,10 @@ class CoroutineApplication extends Application
      */
     public function resolved($abstract)
     {
+        if ($this->resolvesToProxy($abstract) || $this->hasScopedInstance($abstract)) {
+            return true;
+        }
+
         return $this->getCurrentApp()->resolved($abstract);
     }
 
@@ -153,6 +228,18 @@ class CoroutineApplication extends Application
      */
     public function instance($abstract, $instance)
     {
+        if ($this->resolvesToProxy($abstract)) {
+            return $this;
+        }
+
+        $scope = $this->getRequestScope();
+
+        if ($scope instanceof RequestScope && is_string($abstract = $this->normalizeAbstract($abstract))) {
+            $scope->set($abstract, $instance);
+
+            return $instance;
+        }
+
         return $this->getCurrentApp()->instance($abstract, $instance);
     }
 
@@ -331,6 +418,18 @@ class CoroutineApplication extends Application
      */
     public function forgetInstance($abstract)
     {
+        if ($this->resolvesToProxy($abstract)) {
+            return;
+        }
+
+        $scope = $this->getRequestScope();
+
+        if ($scope instanceof RequestScope && is_string($abstract = $this->normalizeAbstract($abstract))) {
+            $scope->forget($abstract);
+
+            return;
+        }
+
         $this->getCurrentApp()->forgetInstance($abstract);
     }
 
@@ -341,6 +440,12 @@ class CoroutineApplication extends Application
      */
     public function forgetInstances()
     {
+        if (($scope = $this->getRequestScope()) instanceof RequestScope) {
+            $scope->clear();
+
+            return;
+        }
+
         $this->getCurrentApp()->forgetInstances();
     }
 
@@ -351,6 +456,12 @@ class CoroutineApplication extends Application
      */
     public function forgetScopedInstances()
     {
+        if (($scope = $this->getRequestScope()) instanceof RequestScope) {
+            $scope->clear();
+
+            return;
+        }
+
         $this->getCurrentApp()->forgetScopedInstances();
     }
 
@@ -361,6 +472,12 @@ class CoroutineApplication extends Application
      */
     public function flush()
     {
+        if (($scope = $this->getRequestScope()) instanceof RequestScope) {
+            $scope->clear();
+
+            return;
+        }
+
         $this->getCurrentApp()->flush();
     }
 
@@ -376,7 +493,7 @@ class CoroutineApplication extends Application
      */
     public function offsetGet($key): mixed
     {
-        return $this->getCurrentApp()->offsetGet($key);
+        return $this->make($key);
     }
 
     /**
@@ -388,6 +505,12 @@ class CoroutineApplication extends Application
      */
     public function offsetSet($key, $value): void
     {
+        if ($this->getRequestScope() instanceof RequestScope && ! $value instanceof Closure) {
+            $this->instance($key, $value);
+
+            return;
+        }
+
         $this->getCurrentApp()->offsetSet($key, $value);
     }
 
@@ -399,7 +522,7 @@ class CoroutineApplication extends Application
      */
     public function offsetExists($key): bool
     {
-        return $this->getCurrentApp()->offsetExists($key);
+        return $this->bound($key);
     }
 
     /**
@@ -410,7 +533,7 @@ class CoroutineApplication extends Application
      */
     public function offsetUnset($key): void
     {
-        $this->getCurrentApp()->offsetUnset($key);
+        $this->forgetInstance($key);
     }
 
     // =========================================================================
@@ -1185,7 +1308,7 @@ class CoroutineApplication extends Application
 
     public function get(string $id)
     {
-        return $this->getCurrentApp()->get($id);
+        return $this->make($id);
     }
 
     public function getBootstrapProvidersPath()
@@ -1215,7 +1338,7 @@ class CoroutineApplication extends Application
 
     public function has(string $id): bool
     {
-        return $this->getCurrentApp()->has($id);
+        return $this->bound($id);
     }
 
     public function hasDebugModeEnabled()
@@ -1245,6 +1368,10 @@ class CoroutineApplication extends Application
 
     public function isShared($abstract)
     {
+        if ($this->resolvesToProxy($abstract) || $this->hasScopedInstance($abstract)) {
+            return true;
+        }
+
         return $this->getCurrentApp()->isShared($abstract);
     }
 
@@ -1260,7 +1387,7 @@ class CoroutineApplication extends Application
 
     public function makeWith($abstract, array $parameters = [])
     {
-        return $this->getCurrentApp()->makeWith($abstract, $parameters);
+        return $this->make($abstract, $parameters);
     }
 
     public static function mixin($mixin, $replace = true)
