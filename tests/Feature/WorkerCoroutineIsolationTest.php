@@ -85,4 +85,127 @@ class WorkerCoroutineIsolationTest extends TestCase
 
         $this->assertSame([true, true], $contextCleared);
     }
+
+    /**
+     * @requires extension swoole
+     */
+    public function test_route_injected_request_matches_helper_per_coroutine(): void
+    {
+        if (! class_exists(Coroutine::class) || ! function_exists('Swoole\\Coroutine\\run')) {
+            $this->markTestSkipped('Swoole coroutine support is required.');
+        }
+
+        $this->app['router']->get('/request-check', function (Request $request) {
+            Coroutine::sleep(0.01);
+
+            return response()->json([
+                'injected' => [
+                    'path' => $request->path(),
+                    'request_id' => $request->query('request_id'),
+                    'header' => $request->header('X-Test-Id'),
+                ],
+                'helper' => [
+                    'path' => request()->path(),
+                    'request_id' => request()->query('request_id'),
+                    'header' => request()->header('X-Test-Id'),
+                ],
+            ]);
+        });
+
+        $client = new FakeClient([]);
+        $worker = $this->createWorker($client);
+        $worker->boot();
+
+        $requests = [
+            Request::create('/request-check?request_id=alpha', 'GET', [], [], [], ['HTTP_X_TEST_ID' => 'alpha']),
+            Request::create('/request-check?request_id=bravo', 'GET', [], [], [], ['HTTP_X_TEST_ID' => 'bravo']),
+        ];
+
+        \Swoole\Coroutine\run(function () use ($worker, $requests) {
+            $done = new Channel(count($requests));
+
+            foreach ($requests as $request) {
+                Coroutine::create(function () use ($worker, $request, $done) {
+                    $context = new RequestContext(['request' => $request]);
+                    $worker->handle($request, $context);
+                    $done->push(true);
+                });
+            }
+
+            for ($i = 0; $i < count($requests); $i++) {
+                $done->pop();
+            }
+        });
+
+        $this->assertCount(2, $client->responses);
+
+        foreach ($client->responses as $response) {
+            $payload = json_decode($response->getContent(), true);
+
+            $this->assertIsArray($payload);
+            $this->assertSame($payload['injected']['path'], $payload['helper']['path']);
+            $this->assertSame($payload['injected']['request_id'], $payload['helper']['request_id']);
+            $this->assertSame($payload['injected']['header'], $payload['helper']['header']);
+        }
+    }
+
+    /**
+     * @requires extension swoole
+     */
+    public function test_router_and_view_factory_are_isolated_per_coroutine(): void
+    {
+        if (! class_exists(Coroutine::class) || ! function_exists('Swoole\\Coroutine\\run')) {
+            $this->markTestSkipped('Swoole coroutine support is required.');
+        }
+
+        $this->app['router']->get('/router-view-check', function (Request $request) {
+            $requestId = (string) $request->query('request_id');
+            $view = app('view');
+
+            $view->share('request_id', $requestId);
+
+            Coroutine::sleep(0.05);
+
+            return response()->json([
+                'request_id' => $requestId,
+                'router_request_id' => app('router')->getCurrentRequest()?->query('request_id'),
+                'view_request_id' => $view->shared('request_id'),
+            ]);
+        });
+
+        $client = new FakeClient([]);
+        $worker = $this->createWorker($client);
+        $worker->boot();
+
+        $requests = [
+            Request::create('/router-view-check?request_id=alpha', 'GET'),
+            Request::create('/router-view-check?request_id=bravo', 'GET'),
+        ];
+
+        \Swoole\Coroutine\run(function () use ($worker, $requests) {
+            $done = new Channel(count($requests));
+
+            foreach ($requests as $request) {
+                Coroutine::create(function () use ($worker, $request, $done) {
+                    $context = new RequestContext(['request' => $request]);
+                    $worker->handle($request, $context);
+                    $done->push(true);
+                });
+            }
+
+            for ($i = 0; $i < count($requests); $i++) {
+                $done->pop();
+            }
+        });
+
+        $this->assertCount(2, $client->responses);
+
+        foreach ($client->responses as $response) {
+            $payload = json_decode($response->getContent(), true);
+
+            $this->assertIsArray($payload);
+            $this->assertSame($payload['request_id'], $payload['router_request_id']);
+            $this->assertSame($payload['request_id'], $payload['view_request_id']);
+        }
+    }
 }
