@@ -128,58 +128,7 @@ $server->on('request', function ($request, $response) use ($server, $workerState
         usleep(10000); // 10ms
     }
 
-    // Get a worker from the pool with a timeout (Queuing mechanism)
-    $worker = null;
-    if ($workerState->clientPool) {
-        $poolConfig = $serverState['octaneConfig']['swoole']['pool'] ?? [];
-        $waitTimeout = $poolConfig['wait_timeout'] ?? 30.0;
-        $rejectOnFull = $poolConfig['reject_on_full'] ?? false;
-        $overloadStatus = $poolConfig['overload_status'] ?? 503;
-        $retryAfter = $poolConfig['overload_retry_after'] ?? 5;
-
-        if (!is_numeric($waitTimeout)) {
-            $waitTimeout = 30.0;
-        }
-
-        $waitTimeout = (float) $waitTimeout;
-        try {
-            if ($workerState->workerPool) {
-                $worker = $workerState->workerPool->acquire((float) $waitTimeout, (bool) $rejectOnFull);
-            } else {
-                $worker = $workerState->clientPool->pop(0.001);
-
-                if ($worker === false && ! $rejectOnFull && $waitTimeout > 0) {
-                    $worker = $workerState->clientPool->pop((float) $waitTimeout);
-                }
-            }
-        } catch (\Throwable $e) {
-            error_log("❌ Failed to acquire worker from pool: " . $e->getMessage());
-            $worker = null;
-        }
-
-        if (! $worker) {
-            $errCode = $workerState->clientPool->errCode;
-            error_log("❌ Pool pop failed! ErrCode: {$errCode}, Stats: " . json_encode($workerState->clientPool->stats()));
-
-            // Timeout occurred - pool is exhausted and queue is full/slow
-            $response->status((int) $overloadStatus);
-            $response->header('Content-Type', 'application/json');
-            if (is_numeric($retryAfter) && (int) $retryAfter > 0) {
-                $response->header('Retry-After', (string) $retryAfter);
-            }
-            $response->end(json_encode([
-                'error' => 'Service Unavailable',
-                'message' => 'Server is too busy, please try again later',
-                'debug_pool_stats' => $workerState->clientPool->stats(),
-                'debug_err_code' => $errCode,
-                'debug_worker_pool' => $workerState->workerPool ? $workerState->workerPool->stats() : null,
-            ]));
-            return;
-        }
-    } else {
-        // Fallback if pool not initialized (shouldn't happen with new OnWorkerStart)
-        $worker = $workerState->worker;
-    }
+    $worker = $workerState->worker;
 
     $cid = Coroutine::getCid();
     $context = Coroutine::getContext();
@@ -243,22 +192,6 @@ $server->on('request', function ($request, $response) use ($server, $workerState
         }
 
         Monitor::unregisterRequestCoroutine($cid);
-
-        // Return worker to the pool so it remains available for subsequent requests.
-        if ($workerState->workerPool && $worker) {
-            try {
-                $kept = $workerState->workerPool->release($worker);
-            } catch (\Throwable $e) {
-                $kept = false;
-                error_log('⚠️ Worker pool release failed - terminating worker: '.$e->getMessage());
-            }
-
-            if (! $kept) {
-                $worker->terminate();
-            }
-        } elseif ($workerState->clientPool && $worker) {
-            $workerState->clientPool->push($worker, 0.001);
-        }
 
         // Ensure coroutine context is cleared (Swoole does this automatically, but explicit is safe)
         Context::clear();

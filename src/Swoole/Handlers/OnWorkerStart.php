@@ -5,15 +5,12 @@ namespace Laravel\Octane\Swoole\Handlers;
 use Laravel\Octane\ApplicationFactory;
 use Laravel\Octane\Stream;
 use Laravel\Octane\Swoole\Coroutine\Context;
-use Laravel\Octane\Swoole\Coroutine\ChannelPoolLock;
 use Laravel\Octane\Swoole\Coroutine\CoordinatorManager;
 use Laravel\Octane\Swoole\Coroutine\FacadeCache;
-use Laravel\Octane\Swoole\Coroutine\WorkerPool;
 use Laravel\Octane\Swoole\SwooleClient;
 use Laravel\Octane\Swoole\SwooleExtension;
 use Laravel\Octane\Swoole\WorkerState;
 use Laravel\Octane\Worker;
-use Swoole\Coroutine\Channel;
 use Swoole\Http\Server;
 use Throwable;
 use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
@@ -141,7 +138,7 @@ class OnWorkerStart
     }
 
     /**
-     * Boot an HTTP worker with a pool for concurrent request handling.
+     * Boot an HTTP worker with a single shared worker.
      *
      * @param  \Swoole\Http\Server  $server
      * @param  int  $workerId
@@ -149,49 +146,9 @@ class OnWorkerStart
      */
     protected function bootHttpWorker($server, int $workerId)
     {
-        $poolConfig = $this->serverState['octaneConfig']['swoole']['pool'] ?? [];
-        // Pool size determines concurrent requests per Swoole worker
-        // Each pool member is a Worker with its own Laravel app (~50-100MB each)
-        // Trade-off: higher = more concurrency but more memory
-        $poolSize = (int) ($poolConfig['size'] ?? 10);
-        $minSize = (int) ($poolConfig['min_size'] ?? 1);
-        $maxSize = (int) ($poolConfig['max_size'] ?? 100);
-        $idleTimeout = (int) ($poolConfig['idle_timeout'] ?? 10);
-
-        if ($minSize < 0) {
-            $minSize = 0;
-        }
-
-        if ($maxSize < $minSize) {
-            $maxSize = $minSize;
-        }
-
-        if ($maxSize < 1) {
-            $maxSize = 1;
-        }
-
-        $poolSize = max($minSize, min($maxSize, $poolSize));
-
-        error_log("🏊 Creating worker pool with size: {$poolSize} (min: {$minSize}, max: {$maxSize})");
-
-        $channel = new Channel($maxSize);
-        $poolLock = new ChannelPoolLock(new Channel(1));
-        $workerPool = new WorkerPool(
-            $channel,
-            $minSize,
-            $maxSize,
-            fn (int $poolIndex) => $this->createPoolWorker($server, $workerId, $poolIndex),
-            $poolLock,
-            $idleTimeout
-        );
-        $workerPool->seed($poolSize);
-
-        $this->workerState->clientPool = $channel;
-        $this->workerState->workerPool = $workerPool;
-
-        // Keep the first worker as the default for backward compatibility
-        $this->workerState->worker = $this->workerState->clientPool->pop();
-        $this->workerState->clientPool->push($this->workerState->worker);
+        $this->workerState->workerPool = null;
+        $this->workerState->clientPool = null;
+        $this->workerState->worker = $this->createPoolWorker($server, $workerId, 0);
         $this->workerState->client = $this->workerState->worker->getClient() ?? new SwooleClient;
 
         // Install CoroutineApplication proxy as the global container instance
@@ -205,13 +162,10 @@ class OnWorkerStart
         Facade::setFacadeApplication($coroutineApp);
         FacadeCache::disable();
 
-        // Store worker pool in context for easy access
-        Context::set('octane.worker_pool', $this->workerState->clientPool);
         Context::set('octane.worker_id', $workerId);
         Context::set('octane.worker_pid', $this->workerState->workerPid);
-        Context::set('octane.pool_size', $poolSize);
 
-        error_log("✅ Worker pool created successfully with {$poolSize} instances");
+        error_log("✅ HTTP worker #{$workerId} initialized with coroutine application proxy");
 
         $this->warnIfDatabasePoolMinExceedsMaxConnections($this->workerState->worker, $server);
 
