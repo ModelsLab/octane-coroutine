@@ -2,7 +2,9 @@
 
 namespace Laravel\Octane\Swoole\Handlers;
 
+use Illuminate\Foundation\Application;
 use Laravel\Octane\ApplicationFactory;
+use Laravel\Octane\Octane;
 use Laravel\Octane\Stream;
 use Laravel\Octane\Swoole\Coroutine\Context;
 use Laravel\Octane\Swoole\Coroutine\CoordinatorManager;
@@ -162,6 +164,8 @@ class OnWorkerStart
         Facade::setFacadeApplication($coroutineApp);
         FacadeCache::disable();
 
+        $this->prepareCoroutineApplicationForWorkerBoot($baseApp, $coroutineApp);
+
         Context::set('octane.worker_id', $workerId);
         Context::set('octane.worker_pid', $this->workerState->workerPid);
 
@@ -205,6 +209,21 @@ class OnWorkerStart
         $this->configureRedisForCoroutineWorker($worker, $poolIndex, $workerId);
 
         return $worker;
+    }
+
+    /**
+     * Run listeners that only need to wire the shared coroutine proxy once.
+     */
+    protected function prepareCoroutineApplicationForWorkerBoot(Application $app, Application $sandbox): void
+    {
+        $event = (object) [
+            'app' => $app,
+            'sandbox' => $sandbox,
+        ];
+
+        foreach (Octane::prepareApplicationForCoroutineBoot() as $listener) {
+            $app->make($listener)->handle($event);
+        }
     }
 
     /**

@@ -3,6 +3,7 @@
 namespace Tests\Unit;
 
 use Illuminate\Container\Container;
+use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Facade;
 use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
 use Laravel\Octane\Swoole\Handlers\OnWorkerStart;
@@ -70,18 +71,24 @@ class OnWorkerStartPoolFreeTest extends TestCase
         $this->assertTrue($workerState->ready);
         $this->assertNull($workerState->workerPool);
         $this->assertNull($workerState->clientPool);
+        $this->assertSame(1, $handler->prepareCoroutineApplicationForWorkerBootCalls);
+        $this->assertSame($this->app, $handler->preparedApp);
 
         $container = Container::getInstance();
 
         $this->assertInstanceOf(CoroutineApplication::class, $container);
         $this->assertSame($container, Facade::getFacadeApplication());
         $this->assertSame($this->app, $container->getBaseApplication());
+        $this->assertSame($container, $handler->preparedSandbox);
     }
 }
 
 class TestableOnWorkerStart extends OnWorkerStart
 {
     public array $createPoolWorkerInvocations = [];
+    public int $prepareCoroutineApplicationForWorkerBootCalls = 0;
+    public ?Application $preparedApp = null;
+    public ?Application $preparedSandbox = null;
 
     public function __construct(
         SwooleExtension $extension,
@@ -108,5 +115,12 @@ class TestableOnWorkerStart extends OnWorkerStart
 
     protected function warnIfDatabasePoolMinExceedsMaxConnections(Worker $worker, $server): void
     {
+    }
+
+    protected function prepareCoroutineApplicationForWorkerBoot(Application $app, Application $sandbox): void
+    {
+        $this->prepareCoroutineApplicationForWorkerBootCalls++;
+        $this->preparedApp = $app;
+        $this->preparedSandbox = $sandbox;
     }
 }

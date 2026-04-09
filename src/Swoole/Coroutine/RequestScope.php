@@ -11,11 +11,12 @@ use ReflectionException;
  * Lightweight per-request state storage for coroutine isolation.
  *
  * Instead of cloning the entire Application (~3-5MB) per request,
- * this class holds only the ~10 request-scoped bindings that need
+ * this class holds only the request-scoped bindings that need
  * per-coroutine isolation (request, session, auth, config, url, cookie).
  *
- * Process-scoped bindings (router, db, cache, etc.) remain on the
- * shared base Application and are accessed directly.
+ * Most process-scoped bindings remain on the shared base application.
+ * Redis-backed managers are scoped because shared phpredis sockets are
+ * not safe to reuse across concurrent coroutines in the same worker.
  */
 class RequestScope
 {
@@ -139,27 +140,113 @@ class RequestScope
             return $this->get($key);
         }
 
-        $resolved = match ($key) {
+        $resolved = $this->resolveSpecializedBinding($key, $sandbox);
+
+        if ($resolved !== null || $key === 'request') {
+            $this->bindings[$key] = $resolved;
+            $this->rememberAliasBindings($key, $resolved);
+        }
+
+        return $resolved;
+    }
+
+    /**
+     * Resolve bindings that need specialized coroutine-aware instances.
+     *
+     * @param  string  $key
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function resolveSpecializedBinding(string $key, Application $sandbox)
+    {
+        if ($this->isHttpKernelBinding($key)) {
+            return $this->createHttpKernel($sandbox);
+        }
+
+        return match ($key) {
             'auth' => $this->createAuthManager($sandbox),
             'auth.driver' => $this->createAuthDriver($sandbox),
+            'cache', \Illuminate\Contracts\Cache\Factory::class => $this->createCacheManager($sandbox),
+            'cache.store', \Illuminate\Contracts\Cache\Repository::class => $this->createCacheStore($sandbox),
             'config' => $this->cloneConfig(),
             'cookie' => $this->createCookieJar(),
+            \Inertia\ResponseFactory::class => $this->createInertiaResponseFactory(),
+            'log', \Psr\Log\LoggerInterface::class => $this->createLogManager($sandbox),
             'redirect' => $this->createRedirector($sandbox),
+            'redis', \Illuminate\Contracts\Redis\Factory::class => $this->createRedisManager($sandbox),
             'request' => $this->get('request'),
+            'router', \Illuminate\Routing\Router::class, \Illuminate\Contracts\Routing\BindingRegistrar::class, \Illuminate\Contracts\Routing\Registrar::class => $this->createRouter($sandbox),
             'session' => $this->createSessionManager($sandbox),
             'session.store' => $this->createSessionStore($sandbox),
+            \Illuminate\Session\Middleware\StartSession::class => $this->createStartSessionMiddleware($sandbox),
             'url' => $this->createUrlGenerator($sandbox),
+            'view', \Illuminate\Contracts\View\Factory::class => $this->createViewFactory($sandbox),
             \Illuminate\Routing\Contracts\CallableDispatcher::class => new \Illuminate\Routing\CallableDispatcher($sandbox),
             \Illuminate\Routing\Contracts\ControllerDispatcher::class => new \Illuminate\Routing\ControllerDispatcher($sandbox),
             \Illuminate\Contracts\Routing\ResponseFactory::class => $this->createResponseFactory($sandbox),
             default => null,
         };
+    }
 
-        if ($resolved !== null || $key === 'request') {
-            $this->bindings[$key] = $resolved;
+    /**
+     * Determine if the binding is an HTTP kernel implementation.
+     */
+    protected function isHttpKernelBinding(string $key): bool
+    {
+        return $key === \Illuminate\Contracts\Http\Kernel::class
+            || $key === \Illuminate\Foundation\Http\Kernel::class
+            || (class_exists($key) && is_subclass_of($key, \Illuminate\Foundation\Http\Kernel::class));
+    }
+
+    /**
+     * Store equivalent aliases for scoped objects so repeated resolution
+     * within one request returns the same request-local instance.
+     *
+     * @param  string  $key
+     * @param  mixed  $resolved
+     * @return void
+     */
+    protected function rememberAliasBindings(string $key, $resolved): void
+    {
+        if ($this->isHttpKernelBinding($key) && is_object($resolved)) {
+            $this->bindings[\Illuminate\Contracts\Http\Kernel::class] = $resolved;
+            $this->bindings[\Illuminate\Foundation\Http\Kernel::class] = $resolved;
+            $this->bindings[$resolved::class] = $resolved;
+
+            return;
         }
 
-        return $resolved;
+        match ($key) {
+            'router',
+            \Illuminate\Routing\Router::class,
+            \Illuminate\Contracts\Routing\BindingRegistrar::class,
+            \Illuminate\Contracts\Routing\Registrar::class => $this->storeScopedAliases([
+                'router',
+                \Illuminate\Routing\Router::class,
+                \Illuminate\Contracts\Routing\BindingRegistrar::class,
+                \Illuminate\Contracts\Routing\Registrar::class,
+            ], $resolved),
+            'view',
+            \Illuminate\Contracts\View\Factory::class => $this->storeScopedAliases([
+                'view',
+                \Illuminate\Contracts\View\Factory::class,
+            ], $resolved),
+            default => null,
+        };
+    }
+
+    /**
+     * Store a resolved instance under multiple equivalent keys.
+     *
+     * @param  array<int, string>  $aliases
+     * @param  mixed  $resolved
+     * @return void
+     */
+    protected function storeScopedAliases(array $aliases, $resolved): void
+    {
+        foreach ($aliases as $alias) {
+            $this->bindings[$alias] = $resolved;
+        }
     }
 
     /**
@@ -300,6 +387,170 @@ class RequestScope
     }
 
     /**
+     * Create an isolated StartSession middleware bound to the coroutine sandbox.
+     *
+     * StartSession is registered as a singleton in Laravel, so resolving it from the
+     * shared base container would pin a worker-level SessionManager into the web stack.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return \Illuminate\Session\Middleware\StartSession
+     */
+    protected function createStartSessionMiddleware(Application $sandbox): \Illuminate\Session\Middleware\StartSession
+    {
+        return new \Illuminate\Session\Middleware\StartSession(
+            $this->resolve('session', $sandbox),
+            static fn () => $sandbox->make(\Illuminate\Contracts\Cache\Factory::class),
+        );
+    }
+
+    /**
+     * Create an isolated HTTP kernel bound to the coroutine sandbox and router.
+     *
+     * The framework kernel is registered as a singleton and captures the shared
+     * router in its constructor. In coroutine mode we need a per-request clone
+     * so kernel request timestamps and router state are not shared.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createHttpKernel(Application $sandbox)
+    {
+        $kernel = clone $this->app->make(\Illuminate\Contracts\Http\Kernel::class);
+
+        if (method_exists($kernel, 'setApplication')) {
+            $kernel->setApplication($sandbox);
+        } else {
+            $this->setObjectProperty($kernel, 'app', $sandbox);
+        }
+
+        $this->setObjectProperty($kernel, 'router', $sandbox->make('router'));
+        $this->setObjectProperty($kernel, 'requestStartedAt', null);
+        $this->invokeObjectMethod($kernel, 'syncMiddlewareToRouter');
+
+        return $kernel;
+    }
+
+    /**
+     * Create an isolated router bound to the coroutine sandbox.
+     *
+     * The shared router stores the current request and current route on mutable
+     * instance properties, so concurrent requests must not reuse the same object.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return \Illuminate\Routing\Router
+     */
+    protected function createRouter(Application $sandbox): \Illuminate\Routing\Router
+    {
+        return new ScopedRouter($this->app->make('router'), $sandbox);
+    }
+
+    /**
+     * Create an isolated Redis manager for the current coroutine.
+     *
+     * phpredis persistent sockets are process-shared by persistent_id.
+     * In coroutine mode that means concurrent requests in one worker can
+     * contend on the same socket. The coroutine-local manager disables
+     * persistence so each request gets its own short-lived connection.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createRedisManager(Application $sandbox)
+    {
+        $redis = clone $this->app->make('redis');
+
+        $this->setObjectProperty($redis, 'app', $sandbox);
+        $this->setObjectProperty($redis, 'connections', []);
+        $this->setObjectProperty($redis, 'config', $this->createCoroutineRedisConfig($sandbox));
+
+        return $redis;
+    }
+
+    /**
+     * Create an isolated cache manager for the current coroutine.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createCacheManager(Application $sandbox)
+    {
+        $cache = clone $this->app->make('cache');
+
+        $this->setObjectProperty($cache, 'app', $sandbox);
+        $this->setObjectProperty($cache, 'stores', []);
+
+        return $cache;
+    }
+
+    /**
+     * Create the coroutine-local default cache repository.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createCacheStore(Application $sandbox)
+    {
+        $cache = $this->resolve('cache', $sandbox);
+
+        return $cache?->store();
+    }
+
+    /**
+     * Create an isolated Inertia response factory for the current coroutine.
+     *
+     * @return \Inertia\ResponseFactory
+     */
+    protected function createInertiaResponseFactory(): \Inertia\ResponseFactory
+    {
+        return new \Inertia\ResponseFactory;
+    }
+
+    /**
+     * Create an isolated view factory for the current coroutine.
+     *
+     * The base view factory keeps shared data and render-state arrays on the
+     * instance. Cloning preserves boot-time composers and shared globals while
+     * isolating per-request calls to share() and Blade render bookkeeping.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return \Illuminate\Contracts\View\Factory
+     */
+    protected function createViewFactory(Application $sandbox): \Illuminate\Contracts\View\Factory
+    {
+        /** @var \Illuminate\View\Factory $view */
+        $view = clone $this->app->make('view');
+        $view->setContainer($sandbox);
+        $view->share('app', $sandbox);
+        $view->flushState();
+
+        return $view;
+    }
+
+    /**
+     * Create an isolated log manager for the current coroutine.
+     *
+     * Log::shareContext() mutates worker-level state on the shared manager.
+     * Reset resolved channels and shared context so each coroutine gets a
+     * clean logger view while reusing the worker-level logging config.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createLogManager(Application $sandbox)
+    {
+        $log = clone $this->app->make('log');
+
+        if (method_exists($log, 'setApplication')) {
+            $log->setApplication($sandbox);
+        }
+
+        $this->setObjectProperty($log, 'channels', []);
+        $this->setObjectProperty($log, 'sharedContext', []);
+
+        return $log;
+    }
+
+    /**
      * Create a redirector bound to the coroutine sandbox.
      *
      * @param  \Illuminate\Foundation\Application  $sandbox
@@ -360,6 +611,36 @@ class RequestScope
     }
 
     /**
+     * Prepare Redis configuration for a coroutine-local manager.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return array<string, mixed>
+     */
+    protected function createCoroutineRedisConfig(Application $sandbox): array
+    {
+        $redisConfig = $sandbox->make('config')->get('database.redis');
+
+        if (! is_array($redisConfig)) {
+            return [];
+        }
+
+        foreach ($redisConfig as $name => $connection) {
+            if (! is_array($connection) || in_array($name, ['client', 'options', 'clusters'], true)) {
+                continue;
+            }
+
+            if (($connection['persistent'] ?? false) !== true) {
+                continue;
+            }
+
+            $redisConfig[$name]['persistent'] = false;
+            unset($redisConfig[$name]['persistent_id']);
+        }
+
+        return $redisConfig;
+    }
+
+    /**
      * Set a protected property on an object and its parent classes.
      *
      * @param  object  $object
@@ -385,6 +666,36 @@ class RequestScope
             $instanceProperty->setValue($object, $value);
         } catch (ReflectionException) {
             // If the implementation changes upstream, fall back gracefully.
+        }
+    }
+
+    /**
+     * Invoke a protected method on an object when upstream does not expose it.
+     *
+     * @param  object  $object
+     * @param  string  $method
+     * @param  array<int, mixed>  $parameters
+     * @return mixed
+     */
+    protected function invokeObjectMethod(object $object, string $method, array $parameters = [])
+    {
+        try {
+            $reflection = new ReflectionClass($object);
+
+            while (! $reflection->hasMethod($method) && $reflection->getParentClass()) {
+                $reflection = $reflection->getParentClass();
+            }
+
+            if (! $reflection->hasMethod($method)) {
+                return null;
+            }
+
+            $instanceMethod = $reflection->getMethod($method);
+            $instanceMethod->setAccessible(true);
+
+            return $instanceMethod->invokeArgs($object, $parameters);
+        } catch (ReflectionException) {
+            return null;
         }
     }
 }
