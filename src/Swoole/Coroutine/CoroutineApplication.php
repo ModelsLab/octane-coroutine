@@ -149,9 +149,41 @@ class CoroutineApplication extends Application
             if ($scope->has($abstract)) {
                 return $resolved;
             }
+
+            if ($scope->hasBinding($abstract)) {
+                return $scope->resolveBinding($abstract, $this, $parameters);
+            }
+
+            if ($this->shouldBuildInCoroutineScope($abstract)) {
+                return $this->buildScopedConcrete($abstract, $parameters);
+            }
         }
 
         return $this->getCurrentApp()->make($abstract, $parameters);
+    }
+
+    /**
+     * Build an unbound concrete through this proxy so nested dependencies
+     * resolve through RequestScope instead of the shared base container.
+     *
+     * @param  mixed  $concrete
+     * @param  array<int|string, mixed>  $parameters
+     * @return mixed
+     */
+    public function buildScopedConcrete($concrete, array $parameters = [])
+    {
+        return parent::make($concrete, $parameters);
+    }
+
+    /**
+     * Determine if an abstract should be constructed by the proxy container.
+     *
+     * @param  string  $abstract
+     * @return bool
+     */
+    protected function shouldBuildInCoroutineScope(string $abstract): bool
+    {
+        return class_exists($abstract) && ! $this->baseApp->bound($abstract);
     }
 
     /**
@@ -162,7 +194,13 @@ class CoroutineApplication extends Application
      */
     public function bound($abstract)
     {
-        if ($this->resolvesToProxy($abstract) || $this->hasScopedInstance($abstract)) {
+        $scope = $this->getRequestScope();
+
+        if ($this->resolvesToProxy($abstract)
+            || $this->hasScopedInstance($abstract)
+            || ($scope instanceof RequestScope
+                && is_string($abstract = $this->normalizeAbstract($abstract))
+                && $scope->hasBinding($abstract))) {
             return true;
         }
 
@@ -177,7 +215,13 @@ class CoroutineApplication extends Application
      */
     public function resolved($abstract)
     {
-        if ($this->resolvesToProxy($abstract) || $this->hasScopedInstance($abstract)) {
+        $scope = $this->getRequestScope();
+
+        if ($this->resolvesToProxy($abstract)
+            || $this->hasScopedInstance($abstract)
+            || ($scope instanceof RequestScope
+                && is_string($abstract = $this->normalizeAbstract($abstract))
+                && $scope->resolvedBinding($abstract))) {
             return true;
         }
 
@@ -203,6 +247,12 @@ class CoroutineApplication extends Application
      */
     public function singleton($abstract, $concrete = null)
     {
+        if (($scope = $this->getRequestScope()) instanceof RequestScope && is_string($abstract)) {
+            $scope->bind($this->normalizeAbstract($abstract), $concrete, true);
+
+            return;
+        }
+
         $this->getCurrentApp()->singleton($abstract, $concrete);
     }
 
@@ -216,6 +266,12 @@ class CoroutineApplication extends Application
      */
     public function bind($abstract, $concrete = null, $shared = false)
     {
+        if (($scope = $this->getRequestScope()) instanceof RequestScope && is_string($abstract)) {
+            $scope->bind($this->normalizeAbstract($abstract), $concrete, $shared);
+
+            return;
+        }
+
         $this->getCurrentApp()->bind($abstract, $concrete, $shared);
     }
 
@@ -253,6 +309,10 @@ class CoroutineApplication extends Application
      */
     public function call($callback, array $parameters = [], $defaultMethod = null)
     {
+        if ($this->getRequestScope() instanceof RequestScope) {
+            return parent::call($callback, $parameters, $defaultMethod);
+        }
+
         return $this->getCurrentApp()->call($callback, $parameters, $defaultMethod);
     }
 
@@ -301,6 +361,20 @@ class CoroutineApplication extends Application
      */
     public function bindIf($abstract, $concrete = null, $shared = false)
     {
+        if ($this->getRequestScope() instanceof RequestScope && is_string($abstract)) {
+            if (! $this->bound($abstract)) {
+                $this->bind($abstract, $concrete, $shared);
+            }
+
+            return;
+        }
+
+        if (! $this->bound($abstract)) {
+            $this->bind($abstract, $concrete, $shared);
+
+            return;
+        }
+
         $this->getCurrentApp()->bindIf($abstract, $concrete, $shared);
     }
 
@@ -313,6 +387,20 @@ class CoroutineApplication extends Application
      */
     public function singletonIf($abstract, $concrete = null)
     {
+        if ($this->getRequestScope() instanceof RequestScope && is_string($abstract)) {
+            if (! $this->bound($abstract)) {
+                $this->singleton($abstract, $concrete);
+            }
+
+            return;
+        }
+
+        if (! $this->bound($abstract)) {
+            $this->singleton($abstract, $concrete);
+
+            return;
+        }
+
         $this->getCurrentApp()->singletonIf($abstract, $concrete);
     }
 
@@ -325,6 +413,12 @@ class CoroutineApplication extends Application
      */
     public function scoped($abstract, $concrete = null)
     {
+        if (($scope = $this->getRequestScope()) instanceof RequestScope && is_string($abstract)) {
+            $scope->bind($this->normalizeAbstract($abstract), $concrete, true);
+
+            return;
+        }
+
         $this->getCurrentApp()->scoped($abstract, $concrete);
     }
 
@@ -337,6 +431,20 @@ class CoroutineApplication extends Application
      */
     public function scopedIf($abstract, $concrete = null)
     {
+        if ($this->getRequestScope() instanceof RequestScope && is_string($abstract)) {
+            if (! $this->bound($abstract)) {
+                $this->scoped($abstract, $concrete);
+            }
+
+            return;
+        }
+
+        if (! $this->bound($abstract)) {
+            $this->scoped($abstract, $concrete);
+
+            return;
+        }
+
         $this->getCurrentApp()->scopedIf($abstract, $concrete);
     }
 
@@ -952,6 +1060,10 @@ class CoroutineApplication extends Application
      */
     public function getLocale()
     {
+        if ($this->getRequestScope() instanceof RequestScope) {
+            return $this->make('config')->get('app.locale');
+        }
+
         return $this->getCurrentApp()->getLocale();
     }
 
@@ -962,7 +1074,7 @@ class CoroutineApplication extends Application
      */
     public function currentLocale()
     {
-        return $this->getCurrentApp()->currentLocale();
+        return $this->getLocale();
     }
 
     /**
@@ -972,6 +1084,10 @@ class CoroutineApplication extends Application
      */
     public function getFallbackLocale()
     {
+        if ($this->getRequestScope() instanceof RequestScope) {
+            return $this->make('config')->get('app.fallback_locale');
+        }
+
         return $this->getCurrentApp()->getFallbackLocale();
     }
 
@@ -983,6 +1099,20 @@ class CoroutineApplication extends Application
      */
     public function setLocale($locale)
     {
+        if ($this->getRequestScope() instanceof RequestScope) {
+            $config = $this->make('config');
+            $previous = $config->get('app.locale');
+
+            $config->set('app.locale', $locale);
+            $this->make('translator')->setLocale($locale);
+
+            if ($this->bound('events')) {
+                $this->make('events')->dispatch(new \Illuminate\Foundation\Events\LocaleUpdated($locale, $previous));
+            }
+
+            return;
+        }
+
         $this->getCurrentApp()->setLocale($locale);
     }
 
@@ -994,6 +1124,13 @@ class CoroutineApplication extends Application
      */
     public function setFallbackLocale($fallbackLocale)
     {
+        if ($this->getRequestScope() instanceof RequestScope) {
+            $this->make('config')->set('app.fallback_locale', $fallbackLocale);
+            $this->make('translator')->setFallback($fallbackLocale);
+
+            return;
+        }
+
         $this->getCurrentApp()->setFallbackLocale($fallbackLocale);
     }
 
@@ -1005,6 +1142,10 @@ class CoroutineApplication extends Application
      */
     public function isLocale($locale)
     {
+        if ($this->getRequestScope() instanceof RequestScope) {
+            return $this->getLocale() === $locale;
+        }
+
         return $this->getCurrentApp()->isLocale($locale);
     }
 
@@ -1253,6 +1394,10 @@ class CoroutineApplication extends Application
 
     public function build($concrete)
     {
+        if ($this->getRequestScope() instanceof RequestScope) {
+            return parent::build($concrete);
+        }
+
         return $this->getCurrentApp()->build($concrete);
     }
 
@@ -1323,7 +1468,43 @@ class CoroutineApplication extends Application
 
     public function handle(\Symfony\Component\HttpFoundation\Request $request, int $type = self::MAIN_REQUEST, bool $catch = true): \Symfony\Component\HttpFoundation\Response
     {
-        return $this->getCurrentApp()->handle($request, $type, $catch);
+        $scope = $this->getRequestScope();
+
+        if (! $scope instanceof RequestScope) {
+            return $this->getCurrentApp()->handle($request, $type, $catch);
+        }
+
+        if (! $request instanceof \Illuminate\Http\Request) {
+            $request = \Illuminate\Http\Request::createFromBase($request);
+        }
+
+        $keys = [
+            'request',
+            \Illuminate\Http\Request::class,
+            \Symfony\Component\HttpFoundation\Request::class,
+        ];
+        $previous = [];
+
+        foreach ($keys as $key) {
+            $previous[$key] = [
+                'exists' => $scope->has($key),
+                'value' => $scope->get($key),
+            ];
+
+            $scope->set($key, $request);
+        }
+
+        try {
+            return $this->make(\Illuminate\Contracts\Http\Kernel::class)->handle($request);
+        } finally {
+            foreach ($previous as $key => $state) {
+                if ($state['exists']) {
+                    $scope->set($key, $state['value']);
+                } else {
+                    $scope->forget($key);
+                }
+            }
+        }
     }
 
     public function handleCommand(\Symfony\Component\Console\Input\InputInterface $input)

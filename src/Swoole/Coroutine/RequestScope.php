@@ -2,8 +2,12 @@
 
 namespace Laravel\Octane\Swoole\Coroutine;
 
+use Closure;
+use Illuminate\Cache\CacheManager;
 use Illuminate\Foundation\Application;
 use Illuminate\Http\Request;
+use Illuminate\Redis\RedisManager;
+use Illuminate\Session\SessionManager;
 use ReflectionClass;
 use ReflectionException;
 
@@ -26,6 +30,20 @@ class RequestScope
      * @var array<string, mixed>
      */
     private array $bindings = [];
+
+    /**
+     * Request-local binding definitions registered during the current request.
+     *
+     * @var array<string, array{concrete: mixed, shared: bool}>
+     */
+    private array $bindingDefinitions = [];
+
+    /**
+     * Resolved shared instances for request-local binding definitions.
+     *
+     * @var array<string, mixed>
+     */
+    private array $resolvedBindings = [];
 
     /**
      * The base application instance (shared, read-only reference).
@@ -106,7 +124,83 @@ class RequestScope
      */
     public function forget(string $key): void
     {
-        unset($this->bindings[$key]);
+        unset($this->bindings[$key], $this->bindingDefinitions[$key], $this->resolvedBindings[$key]);
+    }
+
+    /**
+     * Register a request-local binding.
+     *
+     * @param  string  $key
+     * @param  mixed  $concrete
+     * @param  bool  $shared
+     * @return void
+     */
+    public function bind(string $key, $concrete = null, bool $shared = false): void
+    {
+        $this->bindingDefinitions[$key] = [
+            'concrete' => $concrete ?? $key,
+            'shared' => $shared,
+        ];
+
+        unset($this->resolvedBindings[$key], $this->bindings[$key]);
+    }
+
+    /**
+     * Determine if a request-local binding exists.
+     *
+     * @param  string  $key
+     * @return bool
+     */
+    public function hasBinding(string $key): bool
+    {
+        return array_key_exists($key, $this->bindingDefinitions);
+    }
+
+    /**
+     * Determine if a request-local binding has already been resolved.
+     *
+     * @param  string  $key
+     * @return bool
+     */
+    public function resolvedBinding(string $key): bool
+    {
+        return array_key_exists($key, $this->resolvedBindings);
+    }
+
+    /**
+     * Resolve a request-local binding definition.
+     *
+     * @param  string  $key
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @param  array<int|string, mixed>  $parameters
+     * @return mixed
+     */
+    public function resolveBinding(string $key, Application $sandbox, array $parameters = [])
+    {
+        $definition = $this->bindingDefinitions[$key] ?? null;
+
+        if ($definition === null) {
+            return null;
+        }
+
+        if ($definition['shared'] && array_key_exists($key, $this->resolvedBindings)) {
+            return $this->resolvedBindings[$key];
+        }
+
+        $concrete = $definition['concrete'];
+
+        $resolved = match (true) {
+            $concrete instanceof Closure => $concrete($sandbox, $parameters),
+            is_string($concrete) && method_exists($sandbox, 'buildScopedConcrete') => $sandbox->buildScopedConcrete($concrete, $parameters),
+            is_string($concrete) => $sandbox->make($concrete, $parameters),
+            default => $concrete,
+        };
+
+        if ($definition['shared']) {
+            $this->resolvedBindings[$key] = $resolved;
+        }
+
+        return $resolved;
     }
 
     /**
@@ -174,10 +268,11 @@ class RequestScope
             'log', \Psr\Log\LoggerInterface::class => $this->createLogManager($sandbox),
             'redirect' => $this->createRedirector($sandbox),
             'redis', \Illuminate\Contracts\Redis\Factory::class => $this->createRedisManager($sandbox),
-            'request' => $this->get('request'),
+            'request', \Illuminate\Http\Request::class, \Symfony\Component\HttpFoundation\Request::class => $this->get('request'),
             'router', \Illuminate\Routing\Router::class, \Illuminate\Contracts\Routing\BindingRegistrar::class, \Illuminate\Contracts\Routing\Registrar::class => $this->createRouter($sandbox),
             'session' => $this->createSessionManager($sandbox),
             'session.store' => $this->createSessionStore($sandbox),
+            'translator', \Illuminate\Contracts\Translation\Translator::class, \Illuminate\Translation\Translator::class => $this->createTranslator($sandbox),
             \Illuminate\Session\Middleware\StartSession::class => $this->createStartSessionMiddleware($sandbox),
             'url' => $this->createUrlGenerator($sandbox),
             'view', \Illuminate\Contracts\View\Factory::class => $this->createViewFactory($sandbox),
@@ -217,6 +312,13 @@ class RequestScope
         }
 
         match ($key) {
+            'request',
+            \Illuminate\Http\Request::class,
+            \Symfony\Component\HttpFoundation\Request::class => $this->storeScopedAliases([
+                'request',
+                \Illuminate\Http\Request::class,
+                \Symfony\Component\HttpFoundation\Request::class,
+            ], $resolved),
             'router',
             \Illuminate\Routing\Router::class,
             \Illuminate\Contracts\Routing\BindingRegistrar::class,
@@ -230,6 +332,13 @@ class RequestScope
             \Illuminate\Contracts\View\Factory::class => $this->storeScopedAliases([
                 'view',
                 \Illuminate\Contracts\View\Factory::class,
+            ], $resolved),
+            'translator',
+            \Illuminate\Contracts\Translation\Translator::class,
+            \Illuminate\Translation\Translator::class => $this->storeScopedAliases([
+                'translator',
+                \Illuminate\Contracts\Translation\Translator::class,
+                \Illuminate\Translation\Translator::class,
             ], $resolved),
             default => null,
         };
@@ -276,8 +385,106 @@ class RequestScope
      */
     public function clear(): void
     {
+        $this->releaseScopedResources();
+
         $this->bindings = [];
+        $this->bindingDefinitions = [];
+        $this->resolvedBindings = [];
         $this->configCloned = false;
+    }
+
+    /**
+     * Close request-local managers that can otherwise keep sockets alive after
+     * the coroutine finishes.
+     *
+     * @return void
+     */
+    private function releaseScopedResources(): void
+    {
+        $seen = [];
+
+        foreach (array_merge($this->bindings, $this->resolvedBindings) as $resource) {
+            if (! is_object($resource)) {
+                continue;
+            }
+
+            $objectId = spl_object_id($resource);
+            if (isset($seen[$objectId])) {
+                continue;
+            }
+
+            $seen[$objectId] = true;
+            $this->releaseScopedResource($resource);
+        }
+    }
+
+    /**
+     * Release a single request-scoped manager.
+     *
+     * @param  object  $resource
+     * @return void
+     */
+    private function releaseScopedResource(object $resource): void
+    {
+        try {
+            if ($resource instanceof RedisManager) {
+                foreach ($this->redisConnectionNames() as $name) {
+                    $resource->purge($name);
+                }
+
+                return;
+            }
+
+            if ($resource instanceof CacheManager) {
+                foreach ($this->cacheStoreNames() as $store) {
+                    $resource->forgetDriver($store);
+                }
+
+                return;
+            }
+
+            if ($resource instanceof SessionManager) {
+                $resource->forgetDrivers();
+            }
+        } catch (\Throwable $e) {
+            error_log('⚠️ Failed to release request-scoped resource: '.$e->getMessage());
+        }
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function redisConnectionNames(): array
+    {
+        $redisConfig = $this->app->make('config')->get('database.redis', []);
+
+        if (! is_array($redisConfig)) {
+            return ['default'];
+        }
+
+        $names = array_filter(array_keys($redisConfig), static function ($name) use ($redisConfig) {
+            return is_array($redisConfig[$name] ?? null)
+                && ! in_array($name, ['client', 'options', 'clusters'], true);
+        });
+
+        return array_values($names ?: ['default']);
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function cacheStoreNames(): array
+    {
+        $config = $this->app->make('config');
+        $stores = $config->get('cache.stores', []);
+        $default = $config->get('cache.default');
+        $names = is_array($stores) ? array_keys($stores) : [];
+
+        if (is_string($default) && $default !== '') {
+            $names[] = $default;
+        }
+
+        return array_values(array_unique(array_filter($names, 'is_string')));
     }
 
     /**
@@ -384,6 +591,28 @@ class RequestScope
         $session = $this->resolve('session', $sandbox);
 
         return $session?->driver();
+    }
+
+    /**
+     * Create an isolated translator for the current coroutine.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createTranslator(Application $sandbox)
+    {
+        $translator = clone $this->app->make('translator');
+        $config = $sandbox->make('config');
+
+        if (method_exists($translator, 'setLocale')) {
+            $translator->setLocale($config->get('app.locale'));
+        }
+
+        if (method_exists($translator, 'setFallback')) {
+            $translator->setFallback($config->get('app.fallback_locale'));
+        }
+
+        return $translator;
     }
 
     /**

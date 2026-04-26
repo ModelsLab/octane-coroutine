@@ -98,5 +98,28 @@ class DatabaseManager extends BaseDatabaseManager
                 Context::delete($connectionKey);
             }
         }
+
+        $this->pruneIdleConnections();
+    }
+
+    public function pruneIdleConnections(): int
+    {
+        $closed = 0;
+
+        foreach ($this->pools as $pool) {
+            if ($pool instanceof DatabasePool) {
+                $closed += $pool->pruneIdleConnections();
+            }
+        }
+
+        return $closed;
+    }
+
+    public function poolStats(): array
+    {
+        return array_map(
+            static fn (DatabasePool $pool): array => $pool->getStats(),
+            $this->pools
+        );
     }
 }

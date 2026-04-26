@@ -89,7 +89,7 @@ class Worker implements WorkerContract
 
             $sandbox = Container::getInstance();
 
-            if (! $sandbox instanceof Application) {
+            if (! $sandbox instanceof CoroutineApplication) {
                 $sandbox = new CoroutineApplication($this->app);
                 Container::setInstance($sandbox);
             }
@@ -134,20 +134,31 @@ class Worker implements WorkerContract
         } catch (Throwable $e) {
             $this->handleWorkerError($e, $sandbox, $request, $context, $responded);
         } finally {
+            if ($inCoroutine) {
+                // Release coroutine-local database connections before flushing
+                // request scope. Flushing first can drop the context references
+                // needed by the pool, leaving its counters exhausted while PDOs
+                // are already gone.
+                try {
+                    if ($sandbox->bound('db')) {
+                        $db = $sandbox->make('db');
+                        if (method_exists($db, 'releaseConnections')) {
+                            $db->releaseConnections();
+                        }
+                    }
+
+                    $this->releaseDatabaseConnectionsFromContext();
+                } catch (Throwable $e) {
+                    error_log('⚠️ Failed to release coroutine DB connections: '.$e->getMessage());
+                }
+            }
+
             $sandbox->flush();
 
             $this->app->make('view.engine.resolver')->forget('blade');
             $this->app->make('view.engine.resolver')->forget('php');
 
             if ($inCoroutine) {
-                // Release database connections
-                if ($sandbox->bound('db')) {
-                    $db = $sandbox->make('db');
-                    if (method_exists($db, 'releaseConnections')) {
-                        $db->releaseConnections();
-                    }
-                }
-
                 Context::clear();
             } else {
                 CurrentApplication::set($this->app);
@@ -157,6 +168,28 @@ class Worker implements WorkerContract
             // plus reset the current application state back to its original state before
             // it was cloned. Then we will be ready for the next worker iteration loop.
             unset($gateway, $sandbox, $scope, $context, $request, $response, $octaneResponse, $output);
+        }
+    }
+
+    /**
+     * Release DB pools directly from coroutine context as a final guard.
+     */
+    protected function releaseDatabaseConnectionsFromContext(): void
+    {
+        foreach (Context::all() as $key => $value) {
+            if (! is_string($key) || ! str_ends_with($key, '.pool')) {
+                continue;
+            }
+
+            $connectionKey = str_replace('.pool', '', $key);
+            $connection = Context::get($connectionKey);
+
+            if ($connection && $value instanceof \Laravel\Octane\Swoole\Database\DatabasePool) {
+                $value->release($connection);
+            }
+
+            Context::delete($key);
+            Context::delete($connectionKey);
         }
     }
 

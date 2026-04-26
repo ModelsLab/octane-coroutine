@@ -100,16 +100,20 @@ class DatabasePoolTest extends TestCase
         $expectedKeys = [
             'current_connections',
             'available_connections',
+            'idle_tracked_connections',
             'max_connections',
             'min_connections',
+            'max_idle_time',
         ];
 
         // Simulated stats (what the real implementation returns)
         $stats = [
             'current_connections' => 5,
             'available_connections' => 3,
+            'idle_tracked_connections' => 3,
             'max_connections' => 10,
             'min_connections' => 1,
+            'max_idle_time' => 60.0,
         ];
 
         foreach ($expectedKeys as $key) {
@@ -128,8 +132,11 @@ class DatabasePoolTest extends TestCase
         $pdo->shouldReceive('exec')->with('SET autocommit = 1')->once();
 
         $connection = Mockery::mock(Connection::class);
+        $connection->shouldReceive('transactionLevel')->andReturn(0);
         $connection->shouldReceive('getPdo')->andReturn($pdo);
         $connection->shouldReceive('flushQueryLog')->once();
+        $connection->shouldReceive('forgetRecordModificationState')->once();
+        $connection->shouldReceive('setReadWriteType')->with(null)->once();
         $connection->shouldReceive('getDriverName')->andReturn('mysql');
 
         $this->invokeResetConnection($pool, $connection);
@@ -146,13 +153,37 @@ class DatabasePoolTest extends TestCase
         $pdo->shouldReceive('exec')->with('RESET ALL')->once();
 
         $connection = Mockery::mock(Connection::class);
+        $connection->shouldReceive('transactionLevel')->andReturn(0);
         $connection->shouldReceive('getPdo')->andReturn($pdo);
         $connection->shouldReceive('flushQueryLog')->once();
+        $connection->shouldReceive('forgetRecordModificationState')->once();
+        $connection->shouldReceive('setReadWriteType')->with(null)->once();
         $connection->shouldReceive('getDriverName')->andReturn('pgsql');
 
         $this->invokeResetConnection($pool, $connection);
 
         $this->assertTrue(true);
+    }
+
+    public function test_reset_connection_resets_laravel_transaction_level(): void
+    {
+        if (! extension_loaded('pdo_sqlite')) {
+            $this->markTestSkipped('PDO SQLite is required.');
+        }
+
+        $pool = $this->newPoolWithoutConstructor();
+        $pdo = new PDO('sqlite::memory:');
+        $connection = new Connection($pdo, 'database', '', []);
+
+        $connection->beginTransaction();
+
+        $this->assertSame(1, $connection->transactionLevel());
+        $this->assertTrue($pdo->inTransaction());
+
+        $this->invokeResetConnection($pool, $connection);
+
+        $this->assertSame(0, $connection->transactionLevel());
+        $this->assertFalse($pdo->inTransaction());
     }
 
     public function test_get_creates_connection_immediately_when_pool_can_grow()
@@ -253,6 +284,128 @@ class DatabasePoolTest extends TestCase
         $this->assertSame($connection, $result);
     }
 
+    public function test_get_resets_dirty_laravel_transaction_before_returning_connection(): void
+    {
+        $this->skipIfNoSwooleCoroutine();
+
+        if (! extension_loaded('pdo_sqlite')) {
+            $this->markTestSkipped('PDO SQLite is required.');
+        }
+
+        $connection = new Connection(new PDO('sqlite::memory:'), 'database', '', []);
+        $connection->beginTransaction();
+
+        $factory = Mockery::mock(ConnectionFactory::class);
+        $factory->shouldReceive('make')
+            ->once()
+            ->withAnyArgs()
+            ->andReturn($connection);
+
+        $returned = null;
+
+        \Swoole\Coroutine\run(function () use ($factory, &$returned) {
+            $pool = new DatabasePool([
+                'min_connections' => 1,
+                'max_connections' => 1,
+                'wait_timeout' => 0.1,
+            ], [], 'sqlite', $factory);
+
+            $returned = $pool->get();
+        });
+
+        $this->assertSame($connection, $returned);
+        $this->assertSame(0, $connection->transactionLevel());
+        $this->assertFalse($connection->getPdo()->inTransaction());
+    }
+
+    public function test_get_resets_dirty_pdo_transaction_before_returning_connection(): void
+    {
+        $this->skipIfNoSwooleCoroutine();
+
+        if (! extension_loaded('pdo_sqlite')) {
+            $this->markTestSkipped('PDO SQLite is required.');
+        }
+
+        $pdo = new PDO('sqlite::memory:');
+        $pdo->beginTransaction();
+        $connection = new Connection($pdo, 'database', '', []);
+
+        $this->assertSame(0, $connection->transactionLevel());
+        $this->assertTrue($pdo->inTransaction());
+
+        $factory = Mockery::mock(ConnectionFactory::class);
+        $factory->shouldReceive('make')
+            ->once()
+            ->withAnyArgs()
+            ->andReturn($connection);
+
+        $returned = null;
+
+        \Swoole\Coroutine\run(function () use ($factory, &$returned) {
+            $pool = new DatabasePool([
+                'min_connections' => 1,
+                'max_connections' => 1,
+                'wait_timeout' => 0.1,
+            ], [], 'sqlite', $factory);
+
+            $returned = $pool->get();
+        });
+
+        $this->assertSame($connection, $returned);
+        $this->assertSame(0, $connection->transactionLevel());
+        $this->assertFalse($connection->getPdo()->inTransaction());
+    }
+
+    public function test_prune_idle_connections_closes_available_connections_above_minimum(): void
+    {
+        $this->skipIfNoSwooleCoroutine();
+
+        $connections = [
+            Mockery::mock(Connection::class),
+            Mockery::mock(Connection::class),
+            Mockery::mock(Connection::class),
+        ];
+
+        $connections[0]->shouldReceive('disconnect')->once();
+        $connections[1]->shouldReceive('disconnect')->once();
+        $connections[2]->shouldNotReceive('disconnect');
+
+        $factory = Mockery::mock(ConnectionFactory::class);
+        $factory->shouldReceive('make')
+            ->times(3)
+            ->withAnyArgs()
+            ->andReturn($connections[0], $connections[1], $connections[2]);
+
+        $closed = null;
+        $stats = null;
+
+        \Swoole\Coroutine\run(function () use ($factory, &$closed, &$stats) {
+            $pool = new DatabasePool([
+                'min_connections' => 3,
+                'max_connections' => 3,
+                'wait_timeout' => 0.1,
+                'heartbeat' => -1,
+                'max_idle_time' => 0.001,
+            ], [], 'mysql', $factory);
+
+            $this->setPoolConfig($pool, [
+                'min_connections' => 1,
+                'max_connections' => 3,
+                'wait_timeout' => 0.1,
+                'heartbeat' => -1,
+                'max_idle_time' => 0.001,
+            ]);
+
+            $closed = $pool->pruneIdleConnections(microtime(true) + 1);
+            $stats = $pool->getStats();
+        });
+
+        $this->assertSame(2, $closed);
+        $this->assertSame(1, $stats['current_connections']);
+        $this->assertSame(1, $stats['available_connections']);
+        $this->assertSame(1, $stats['idle_tracked_connections']);
+    }
+
     protected function newPoolWithoutConstructor(): DatabasePool
     {
         $reflection = new \ReflectionClass(DatabasePool::class);
@@ -269,6 +422,13 @@ class DatabasePoolTest extends TestCase
     protected function setPoolCurrentConnections(DatabasePool $pool, int $value): void
     {
         $property = new \ReflectionProperty(DatabasePool::class, 'currentConnections');
+        $property->setAccessible(true);
+        $property->setValue($pool, $value);
+    }
+
+    protected function setPoolConfig(DatabasePool $pool, array $value): void
+    {
+        $property = new \ReflectionProperty(DatabasePool::class, 'config');
         $property->setAccessible(true);
         $property->setValue($pool, $value);
     }

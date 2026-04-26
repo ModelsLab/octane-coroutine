@@ -6,6 +6,7 @@ use Illuminate\Cache\CacheManager;
 use Illuminate\Config\Repository as ConfigRepository;
 use Illuminate\Foundation\Application;
 use Illuminate\Redis\RedisManager;
+use Illuminate\Session\SessionManager;
 use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
 use Laravel\Octane\Swoole\Coroutine\RequestScope;
 use PHPUnit\Framework\TestCase;
@@ -81,6 +82,76 @@ class RequestScopeRedisIsolationTest extends TestCase
         $this->assertSame('worker-session', $baseRedisConfig['session']['persistent_id']);
     }
 
+    public function test_clear_purges_scoped_redis_connections(): void
+    {
+        $base = new Application(__DIR__);
+
+        $config = new ConfigRepository([
+            'database' => [
+                'redis' => [
+                    'client' => 'phpredis',
+                    'options' => [],
+                    'default' => ['host' => '127.0.0.1'],
+                    'cache' => ['host' => '127.0.0.1'],
+                    'session' => ['host' => '127.0.0.1'],
+                ],
+            ],
+            'cache' => [
+                'default' => 'redis',
+                'stores' => [
+                    'array' => ['driver' => 'array'],
+                    'redis' => ['driver' => 'redis', 'connection' => 'default'],
+                ],
+            ],
+        ]);
+
+        $base->instance('config', $config);
+        $redis = new TrackingRedisManager($base, 'phpredis', $config->get('database.redis'));
+
+        $scope = new RequestScope($base);
+        $scope->set('redis', $redis);
+
+        $scope->clear();
+
+        $this->assertSame(['default', 'cache', 'session'], $redis->purged);
+    }
+
+    public function test_clear_forgets_scoped_cache_and_session_drivers(): void
+    {
+        $base = new Application(__DIR__);
+
+        $base->instance('config', new ConfigRepository([
+            'database' => [
+                'redis' => [
+                    'client' => 'phpredis',
+                    'options' => [],
+                    'default' => ['host' => '127.0.0.1'],
+                ],
+            ],
+            'cache' => [
+                'default' => 'redis',
+                'stores' => [
+                    'array' => ['driver' => 'array'],
+                    'redis' => ['driver' => 'redis', 'connection' => 'default'],
+                ],
+            ],
+        ]));
+
+        $cache = new TrackingCacheManager($base);
+        $session = new TrackingSessionManager($base);
+
+        $scope = new RequestScope($base);
+        $scope->set('cache', $cache);
+        $scope->set('session', $session);
+
+        $scope->clear();
+
+        sort($cache->forgotten);
+
+        $this->assertSame(['array', 'redis'], $cache->forgotten);
+        $this->assertTrue($session->forgotDrivers);
+    }
+
     private function readProperty(object $object, string $property)
     {
         $reflection = new ReflectionClass($object);
@@ -93,5 +164,39 @@ class RequestScopeRedisIsolationTest extends TestCase
         $instanceProperty->setAccessible(true);
 
         return $instanceProperty->getValue($object);
+    }
+}
+
+class TrackingRedisManager extends RedisManager
+{
+    /** @var array<int, string> */
+    public array $purged = [];
+
+    public function purge($name = null)
+    {
+        $this->purged[] = $name ?? 'default';
+    }
+}
+
+class TrackingCacheManager extends CacheManager
+{
+    /** @var array<int, string> */
+    public array $forgotten = [];
+
+    public function forgetDriver($name = null)
+    {
+        $this->forgotten[] = $name ?? $this->getDefaultDriver();
+
+        return $this;
+    }
+}
+
+class TrackingSessionManager extends SessionManager
+{
+    public bool $forgotDrivers = false;
+
+    public function forgetDrivers()
+    {
+        $this->forgotDrivers = true;
     }
 }

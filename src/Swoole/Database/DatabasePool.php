@@ -5,6 +5,7 @@ namespace Laravel\Octane\Swoole\Database;
 use Swoole\Coroutine\Channel;
 use Illuminate\Database\Connectors\ConnectionFactory;
 use Illuminate\Database\Connection;
+use Swoole\Timer;
 use Throwable;
 
 /**
@@ -18,6 +19,8 @@ class DatabasePool
     protected string $name;
     protected ConnectionFactory $factory;
     protected array $connectionConfig;
+    protected array $idleSince = [];
+    protected ?int $idlePruneTimerId = null;
 
     public function __construct(array $config, array $connectionConfig, string $name, ConnectionFactory $factory)
     {
@@ -35,11 +38,15 @@ class DatabasePool
         $minConnections = $config['min_connections'] ?? 1;
         for ($i = 0; $i < $minConnections; $i++) {
             try {
-                $this->channel->push($this->createConnection());
+                $connection = $this->createConnection();
+                $this->markIdle($connection);
+                $this->channel->push($connection);
             } catch (Throwable $e) {
-                error_log("❌ Failed to create initial pool connection: " . $e->getMessage());
+                error_log('❌ Failed to create initial pool connection: '.$e->getMessage());
             }
         }
+
+        $this->startIdlePruner();
     }
 
     /**
@@ -47,6 +54,8 @@ class DatabasePool
      */
     public function get()
     {
+        $this->pruneIdleConnections();
+
         $waitTimeout = $this->config['wait_timeout'] ?? 3.0;
         $maxConnections = $this->config['max_connections'] ?? 10;
 
@@ -67,9 +76,23 @@ class DatabasePool
             }
         }
 
+        $this->markBorrowed($connection);
+
         // Check if connection is still valid
-        if (!$this->checkConnection($connection)) {
+        if (! $this->checkConnection($connection)) {
             $connection = $this->reconnect($connection);
+        }
+
+        // Defensive cleanup on checkout as well as release. If a previous
+        // request left PDO or Laravel transaction state dirty, never hand that
+        // connection to the next coroutine.
+        try {
+            $this->resetConnection($connection);
+        } catch (Throwable $e) {
+            error_log('❌ Dirty DB connection could not be reset on checkout: '.$e->getMessage());
+            $this->closeConnection($connection);
+            $this->currentConnections--;
+            $connection = $this->createConnection();
         }
 
         return $connection;
@@ -80,27 +103,79 @@ class DatabasePool
      */
     public function release($connection): void
     {
-        if (!$connection) {
+        if (! $connection) {
             return;
         }
 
         try {
             $this->resetConnection($connection);
+            $this->markIdle($connection);
 
             $pushTimeout = $this->config['release_timeout'] ?? 1.0;
             $pushed = $this->channel->push($connection, $pushTimeout);
 
-            if (!$pushed) {
-                error_log("⚠️ DB pool release timeout - closing connection instead");
+            if (! $pushed) {
+                error_log('⚠️ DB pool release timeout - closing connection instead');
+                $this->markBorrowed($connection);
                 $this->closeConnection($connection);
                 $this->currentConnections--;
             }
         } catch (Throwable $e) {
-            error_log("❌ Error releasing connection to pool: " . $e->getMessage());
+            error_log('❌ Error releasing connection to pool: '.$e->getMessage());
             // Try to close the connection to prevent leaks
+            $this->markBorrowed($connection);
             $this->closeConnection($connection);
             $this->currentConnections--;
         }
+
+        $this->pruneIdleConnections();
+    }
+
+    /**
+     * Close idle pooled connections above min_connections.
+     */
+    public function pruneIdleConnections(?float $now = null): int
+    {
+        $maxIdleTime = (float) ($this->config['max_idle_time'] ?? 60.0);
+
+        if ($maxIdleTime <= 0 || $this->currentConnections <= ($this->config['min_connections'] ?? 1)) {
+            return 0;
+        }
+
+        $now ??= microtime(true);
+        $minConnections = (int) ($this->config['min_connections'] ?? 1);
+        $available = $this->channel->length();
+        $kept = [];
+        $closed = 0;
+
+        for ($i = 0; $i < $available; $i++) {
+            $connection = $this->channel->pop(0.001);
+
+            if ($connection === false) {
+                break;
+            }
+
+            $connectionId = spl_object_id($connection);
+            $idleSince = $this->idleSince[$connectionId] ?? $now;
+            $idleFor = $now - $idleSince;
+
+            if ($this->currentConnections > $minConnections && $idleFor >= $maxIdleTime) {
+                unset($this->idleSince[$connectionId]);
+                $this->closeConnection($connection);
+                $this->currentConnections--;
+                $closed++;
+
+                continue;
+            }
+
+            $kept[] = $connection;
+        }
+
+        foreach ($kept as $connection) {
+            $this->channel->push($connection, 0.001);
+        }
+
+        return $closed;
     }
 
     /**
@@ -111,16 +186,34 @@ class DatabasePool
         try {
             // Check if there's an active transaction and roll it back
             if ($connection instanceof Connection) {
-                // Roll back any open transaction
+                // Roll back any open transaction through Laravel's Connection
+                // object so both PDO and Laravel's transaction counter reset.
+                if ($connection->transactionLevel() > 0) {
+                    error_log('⚠️ Rolling back uncommitted Laravel transaction before returning to pool');
+                    $connection->rollBack(0);
+                }
+
+                // If the PDO is still in a transaction, force rollback as a
+                // final guard for drivers or edge cases outside Laravel state.
                 $pdo = $connection->getPdo();
 
                 if ($pdo && $pdo->inTransaction()) {
-                    error_log("⚠️ Rolling back uncommitted transaction before returning to pool");
+                    error_log('⚠️ Rolling back uncommitted PDO transaction before returning to pool');
                     $pdo->rollBack();
                 }
 
                 // Reset the query log
                 $connection->flushQueryLog();
+
+                if (method_exists($connection, 'forgetRecordModificationState')) {
+                    $connection->forgetRecordModificationState();
+                } elseif (method_exists($connection, 'recordsHaveBeenModified')) {
+                    $connection->recordsHaveBeenModified(false);
+                }
+
+                if (method_exists($connection, 'setReadWriteType')) {
+                    $connection->setReadWriteType(null);
+                }
 
                 // Reset session variables for MySQL
                 $driver = $connection->getDriverName();
@@ -131,7 +224,7 @@ class DatabasePool
                         $pdo->exec('SET autocommit = 1');
                     } catch (Throwable $e) {
                         // Non-critical, log and continue
-                        error_log("⚠️ Could not reset MySQL session: " . $e->getMessage());
+                        error_log('⚠️ Could not reset MySQL session: '.$e->getMessage());
                     }
                 }
 
@@ -140,12 +233,12 @@ class DatabasePool
                     try {
                         $pdo->exec('RESET ALL');
                     } catch (Throwable $e) {
-                        error_log("⚠️ Could not reset PostgreSQL session: " . $e->getMessage());
+                        error_log('⚠️ Could not reset PostgreSQL session: '.$e->getMessage());
                     }
                 }
             }
         } catch (Throwable $e) {
-            error_log("❌ Error resetting connection state: " . $e->getMessage());
+            error_log('❌ Error resetting connection state: '.$e->getMessage());
             // If reset fails, the connection may be in a bad state
             throw $e;
         }
@@ -161,7 +254,7 @@ class DatabasePool
                 $connection->disconnect();
             }
         } catch (Throwable $e) {
-            error_log("⚠️ Error closing connection: " . $e->getMessage());
+            error_log('⚠️ Error closing connection: '.$e->getMessage());
         }
     }
 
@@ -171,7 +264,28 @@ class DatabasePool
     protected function createConnection()
     {
         $this->currentConnections++;
-        return $this->factory->make($this->connectionConfig, $this->name);
+
+        try {
+            return $this->factory->make($this->connectionConfig, $this->name);
+        } catch (Throwable $e) {
+            $this->currentConnections--;
+
+            throw $e;
+        }
+    }
+
+    protected function markIdle($connection): void
+    {
+        if (is_object($connection)) {
+            $this->idleSince[spl_object_id($connection)] = microtime(true);
+        }
+    }
+
+    protected function markBorrowed($connection): void
+    {
+        if (is_object($connection)) {
+            unset($this->idleSince[spl_object_id($connection)]);
+        }
     }
 
     /**
@@ -198,6 +312,8 @@ class DatabasePool
             return $connection;
         } catch (Throwable $e) {
             // If reconnect fails, create a new one
+            $this->markBorrowed($connection);
+            $this->closeConnection($connection);
             $this->currentConnections--;
             return $this->createConnection();
         }
@@ -217,6 +333,7 @@ class DatabasePool
                 break; // No more connections in channel
             }
 
+            $this->markBorrowed($connection);
             $this->closeConnection($connection);
             $this->currentConnections--;
         }
@@ -230,8 +347,29 @@ class DatabasePool
         return [
             'current_connections' => $this->currentConnections,
             'available_connections' => $this->channel->length(),
+            'idle_tracked_connections' => count($this->idleSince),
             'max_connections' => $this->config['max_connections'] ?? 10,
             'min_connections' => $this->config['min_connections'] ?? 1,
+            'max_idle_time' => $this->config['max_idle_time'] ?? 60.0,
         ];
+    }
+
+    protected function startIdlePruner(): void
+    {
+        $heartbeat = (float) ($this->config['heartbeat'] ?? -1);
+        $maxIdleTime = (float) ($this->config['max_idle_time'] ?? 60.0);
+
+        if ($heartbeat <= 0 || $maxIdleTime <= 0 || $this->idlePruneTimerId !== null) {
+            return;
+        }
+
+        if (! class_exists(Timer::class)) {
+            return;
+        }
+
+        $intervalMs = max(1000, (int) round($heartbeat * 1000));
+        $this->idlePruneTimerId = Timer::tick($intervalMs, function (): void {
+            $this->pruneIdleConnections();
+        });
     }
 }

@@ -69,7 +69,7 @@ php artisan octane:install swoole
 
 ```bash
 # Install latest stable
-composer require modelslab/octane-coroutine:^0.8.6
+composer require modelslab/octane-coroutine:^0.8.7
 
 # Install development version
 composer require modelslab/octane-coroutine:dev-main
@@ -92,7 +92,7 @@ php artisan octane:reload
 ```json
 {
     "require": {
-        "modelslab/octane-coroutine": "^0.8.6"
+        "modelslab/octane-coroutine": "^0.8.7"
     }
 }
 ```
@@ -139,6 +139,15 @@ REDIS_CLIENT=phpredis
 # Database (disable PDO persistent connections in coroutine mode)
 DB_PERSISTENT=false
 
+# Database pool cleanup. Keep these enabled in production so burst-created
+# idle sockets are pruned instead of retained until worker shutdown.
+DB_POOL_HEARTBEAT=10
+DB_POOL_MAX_IDLE_TIME=60
+
+# Redis persistent sockets are unsafe for request-scoped coroutine managers.
+REDIS_PERSISTENT=false
+REDIS_SESSION_PERSISTENT=false
+
 # Optional startup warning buffer for DB min_connections planning
 OCTANE_POOL_DB_MAX_CONNECTIONS_BUFFER=10
 ```
@@ -152,8 +161,53 @@ Notes:
   - `REDIS_CLIENT=predis`
   - `REDIS_PERSISTENT=false`
 - **PDO persistent connections** can cause cross-coroutine contention; keep them off.
+- **DB pool max connections are per worker**. The effective upper bound is
+  `workers × DB_POOL_MAX_CONNECTIONS`, so size the pool below your database
+  server's `max_connections` budget.
+- **Long external waits should not hold backend sockets**. For AI/API workloads
+  that wait 60-120 seconds on an upstream provider, release DB/Redis handles
+  before the external wait whenever the request no longer needs them.
 - Database connection pooling in `config/database.php` is separate from the HTTP runtime.
   The only `octane.swoole.pool` setting still used is the DB warning buffer above.
+
+### v0.8.7 Production Hardening
+
+Version `v0.8.7` includes the production hardening used for high-concurrency
+AI API workloads:
+
+- `app()->handle()` subrequests now resolve the coroutine-scoped HTTP
+  kernel/router and temporarily swap request bindings only inside the current
+  request scope. This prevents JSON/form/base64 API subrequests from corrupting
+  method, body, query, headers, or the outer `request()` helper.
+- The DB pool rolls back dirty Laravel and PDO transactions before reuse.
+- Idle DB sockets are pruned by heartbeat / max-idle settings.
+- Worker termination releases coroutine DB connections before request scope is
+  flushed, preventing stale pool counters after dirty requests.
+- Request-scoped Redis/cache/session managers are released so sockets do not
+  leak between coroutines.
+
+Regression coverage for this release includes concurrent request isolation,
+nested API shape preservation, request-time container binding isolation,
+locale/translator isolation, Redis manager isolation, dirty DB transaction
+cleanup, and DB idle pruning.
+
+### Validated Stress Results
+
+The `v0.8.7` release was validated in Docker with host-network MySQL and Redis:
+
+- App full suite: `1883 passed`, `2 skipped`, `5446 assertions`.
+- Package suite: `82 tests`, `687 assertions`.
+- Fast full-stack wrk: `7912/7912` PASS, zero leaks/errors.
+- Nested API `app()->handle()` wrk: `15860/15860` PASS, zero leaks/errors.
+- Remote file parity wrk: `4049/4049` PASS, zero leaks/errors.
+- Dirty DB transaction open/check wrk: `15894` dirty opens followed by `15654`
+  clean checks at transaction level `0`, zero leaks/errors.
+- Mixed 0-60s full-stack wrk: `458/458` PASS, zero leaks/errors.
+- Fixed-count `10k x 120s` full-stack blocking IO: `10000/10000` valid JSON
+  `200`, zero leak responses.
+
+After stress, MySQL and Redis returned to baseline (`Threads_connected=1`,
+`connected_clients=1`) with no container log stack traces.
 
 ## 🏊 Understanding Workers and Coroutines
 
