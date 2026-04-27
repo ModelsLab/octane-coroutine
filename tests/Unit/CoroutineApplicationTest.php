@@ -2,8 +2,14 @@
 
 namespace Tests\Unit;
 
+use Illuminate\Contracts\Validation\Factory as ValidationFactoryContract;
+use Illuminate\Contracts\Validation\ValidatesWhenResolved;
 use Illuminate\Foundation\Application;
+use Illuminate\Foundation\Http\FormRequest;
 use Illuminate\Http\Request;
+use Illuminate\Translation\ArrayLoader;
+use Illuminate\Translation\Translator;
+use Illuminate\Validation\Factory as ValidationFactory;
 use Laravel\Octane\Swoole\Coroutine\Context;
 use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
 use Laravel\Octane\Swoole\Coroutine\RequestScope;
@@ -93,11 +99,86 @@ class CoroutineApplicationTest extends TestCase
             'made_user_agent' => 'scoped-agent',
         ], $result);
     }
+
+    public function test_scoped_unbound_concretes_fire_base_resolving_callbacks(): void
+    {
+        $base = new Application(__DIR__);
+        $base->afterResolving(CoroutineApplicationResolvingProbeContract::class, function ($resolved) {
+            $resolved->resolvedByCallback = true;
+        });
+
+        $proxy = new CoroutineApplication($base);
+
+        Context::set('octane.request_scope', new RequestScope($base, Request::create('/scoped')));
+
+        $probe = $proxy->make(CoroutineApplicationResolvingProbe::class);
+
+        $this->assertTrue($probe->resolvedByCallback);
+    }
+
+    public function test_scoped_form_requests_are_prepared_and_validated_by_base_callbacks(): void
+    {
+        $base = new Application(__DIR__);
+        $base->instance('request', Request::create('/base', 'POST'));
+        $base->alias('request', Request::class);
+        $base->alias('request', \Symfony\Component\HttpFoundation\Request::class);
+
+        $translator = new Translator(new ArrayLoader, 'en');
+        $validationFactory = new ValidationFactory($translator);
+        $base->instance(ValidationFactoryContract::class, $validationFactory);
+
+        $base->resolving(FormRequest::class, function ($request, $app) {
+            FormRequest::createFrom($app['request'], $request);
+            $request->setContainer($app);
+        });
+
+        $base->afterResolving(ValidatesWhenResolved::class, function ($resolved) {
+            $resolved->validateResolved();
+        });
+
+        $proxy = new CoroutineApplication($base);
+        $validationFactory->setContainer($proxy);
+
+        Context::set('octane.request_scope', new RequestScope($base, Request::create('/login', 'POST', [
+            'email' => 'valid@example.com',
+            'password' => 'secret-password',
+        ])));
+
+        $request = $proxy->make(CoroutineApplicationLoginFormRequestProbe::class);
+
+        $this->assertSame('valid@example.com', $request->validated('email'));
+        $this->assertSame('secret-password', $request->validated('password'));
+    }
 }
 
 class CoroutineApplicationBuildRequestProbe
 {
     public function __construct(public Request $request)
     {
+    }
+}
+
+interface CoroutineApplicationResolvingProbeContract
+{
+}
+
+class CoroutineApplicationResolvingProbe implements CoroutineApplicationResolvingProbeContract
+{
+    public bool $resolvedByCallback = false;
+}
+
+class CoroutineApplicationLoginFormRequestProbe extends FormRequest
+{
+    public function authorize(): bool
+    {
+        return true;
+    }
+
+    public function rules(): array
+    {
+        return [
+            'email' => ['required', 'email'],
+            'password' => ['required', 'string', 'min:6'],
+        ];
     }
 }

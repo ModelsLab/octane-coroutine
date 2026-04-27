@@ -36,9 +36,33 @@ class CoroutineApplication extends Application
     public function __construct(Application $baseApp)
     {
         $this->baseApp = $baseApp;
+        $this->syncResolvingCallbacksFrom($baseApp);
 
         // We don't call parent constructor - this is intentional.
         // We act purely as a proxy to the current context's application.
+    }
+
+    /**
+     * Copy container resolving callbacks from the real application into this proxy.
+     *
+     * Scoped concrete construction uses parent::make() on this proxy so nested
+     * dependencies can still resolve through RequestScope. Laravel framework
+     * hooks such as FormRequest validation are registered on the base
+     * application during boot, so the proxy needs the same callback tables.
+     */
+    protected function syncResolvingCallbacksFrom(Application $app): void
+    {
+        $this->globalBeforeResolvingCallbacks = $app->globalBeforeResolvingCallbacks;
+        $this->globalResolvingCallbacks = $app->globalResolvingCallbacks;
+        $this->globalAfterResolvingCallbacks = $app->globalAfterResolvingCallbacks;
+        $this->beforeResolvingCallbacks = $app->beforeResolvingCallbacks;
+        $this->resolvingCallbacks = $app->resolvingCallbacks;
+        $this->afterResolvingCallbacks = $app->afterResolvingCallbacks;
+
+        if (property_exists($app, 'afterResolvingAttributeCallbacks')
+            && property_exists($this, 'afterResolvingAttributeCallbacks')) {
+            $this->afterResolvingAttributeCallbacks = $app->afterResolvingAttributeCallbacks;
+        }
     }
 
     /**
@@ -469,6 +493,8 @@ class CoroutineApplication extends Application
      */
     public function beforeResolving($abstract, Closure $callback = null)
     {
+        parent::beforeResolving($abstract, $callback);
+
         $this->getCurrentApp()->beforeResolving($abstract, $callback);
     }
 
@@ -481,6 +507,8 @@ class CoroutineApplication extends Application
      */
     public function resolving($abstract, Closure $callback = null)
     {
+        parent::resolving($abstract, $callback);
+
         $this->getCurrentApp()->resolving($abstract, $callback);
     }
 
@@ -493,6 +521,8 @@ class CoroutineApplication extends Application
      */
     public function afterResolving($abstract, Closure $callback = null)
     {
+        parent::afterResolving($abstract, $callback);
+
         $this->getCurrentApp()->afterResolving($abstract, $callback);
     }
 
@@ -1379,7 +1409,17 @@ class CoroutineApplication extends Application
 
     public function afterResolvingAttribute(string $attribute, \Closure $callback)
     {
-        return $this->getCurrentApp()->afterResolvingAttribute($attribute, $callback);
+        if (method_exists(Application::class, 'afterResolvingAttribute')) {
+            parent::afterResolvingAttribute($attribute, $callback);
+        }
+
+        $app = $this->getCurrentApp();
+
+        if (method_exists($app, 'afterResolvingAttribute')) {
+            return $app->afterResolvingAttribute($attribute, $callback);
+        }
+
+        return null;
     }
 
     public function beforeBootstrapping($bootstrapper, \Closure $callback)
