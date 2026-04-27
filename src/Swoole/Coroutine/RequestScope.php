@@ -73,6 +73,8 @@ class RequestScope
         if ($request !== null) {
             $this->bindings['request'] = $request;
         }
+
+        $this->initializeSentryHubForCoroutine();
     }
 
     /**
@@ -257,6 +259,26 @@ class RequestScope
             return $this->createHttpKernel($sandbox);
         }
 
+        if ($this->isLab404ImpersonateManagerBinding($key)) {
+            return $this->createLab404ImpersonateManager($sandbox);
+        }
+
+        if ($this->isSocialiteFactoryBinding($key)) {
+            return $this->createSocialiteManager($sandbox);
+        }
+
+        if ($this->isBreadcrumbsManagerBinding($key)) {
+            return $this->createBreadcrumbsManager($sandbox);
+        }
+
+        if ($this->isSentryHubBinding($key)) {
+            return $this->createSentryHub();
+        }
+
+        if ($this->isSentryTracingMiddlewareBinding($key)) {
+            return $this->createSentryTracingMiddleware();
+        }
+
         return match ($key) {
             'auth' => $this->createAuthManager($sandbox),
             'auth.driver' => $this->createAuthDriver($sandbox),
@@ -281,6 +303,240 @@ class RequestScope
             \Illuminate\Contracts\Routing\ResponseFactory::class => $this->createResponseFactory($sandbox),
             default => null,
         };
+    }
+
+    /**
+     * Determine if the binding is Lab404's impersonation manager.
+     *
+     * Lab404 stores the application instance in a private property and uses it
+     * later to resolve auth, request, session, events, and cookies. In coroutine
+     * mode the base singleton would otherwise keep talking to worker-level auth
+     * while session() writes to the coroutine-local session.
+     */
+    protected function isLab404ImpersonateManagerBinding(string $key): bool
+    {
+        return $key === 'Lab404\\Impersonate\\Services\\ImpersonateManager'
+            && class_exists($key);
+    }
+
+    /**
+     * Create Lab404's impersonation manager with the coroutine sandbox app.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return object
+     */
+    protected function createLab404ImpersonateManager(Application $sandbox): object
+    {
+        $manager = 'Lab404\\Impersonate\\Services\\ImpersonateManager';
+
+        return new $manager($sandbox);
+    }
+
+    /**
+     * Determine if the binding is Laravel Socialite's manager/factory.
+     *
+     * Socialite caches provider instances on a singleton manager. Providers keep
+     * the current request and session state for OAuth state validation, so the
+     * manager must be sandbox-bound and its per-driver cache must be empty for
+     * every coroutine request.
+     */
+    protected function isSocialiteFactoryBinding(string $key): bool
+    {
+        return in_array($key, [
+            'Laravel\\Socialite\\Contracts\\Factory',
+            'Laravel\\Socialite\\SocialiteManager',
+        ], true) && class_exists('Laravel\\Socialite\\SocialiteManager');
+    }
+
+    /**
+     * Create a coroutine-local Socialite manager.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return object
+     */
+    protected function createSocialiteManager(Application $sandbox): object
+    {
+        $factory = 'Laravel\\Socialite\\Contracts\\Factory';
+        $managerClass = 'Laravel\\Socialite\\SocialiteManager';
+
+        if ($this->app->bound($factory) && is_object($baseManager = $this->app->make($factory))) {
+            $manager = clone $baseManager;
+        } elseif ($this->app->bound($managerClass) && is_object($baseManager = $this->app->make($managerClass))) {
+            $manager = clone $baseManager;
+        } else {
+            $manager = new $managerClass($sandbox);
+        }
+
+        if (method_exists($manager, 'setContainer')) {
+            $manager->setContainer($sandbox);
+        } else {
+            $this->setObjectProperty($manager, 'app', $sandbox);
+            $this->setObjectProperty($manager, 'container', $sandbox);
+            $this->setObjectProperty($manager, 'config', $sandbox->make('config'));
+        }
+
+        if (method_exists($manager, 'forgetDrivers')) {
+            $manager->forgetDrivers();
+        } else {
+            $this->setObjectProperty($manager, 'drivers', []);
+        }
+
+        return $manager;
+    }
+
+    /**
+     * Determine if the binding is Diglactic Breadcrumbs' manager.
+     *
+     * The package registers callbacks during boot on a singleton manager, but
+     * the same object also owns a mutable generator and a router reference used
+     * to inspect the current route. In coroutine mode those runtime pieces must
+     * be fresh for each request.
+     */
+    protected function isBreadcrumbsManagerBinding(string $key): bool
+    {
+        return $key === 'Diglactic\\Breadcrumbs\\Manager'
+            && class_exists($key);
+    }
+
+    /**
+     * Create a coroutine-local Breadcrumbs manager.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return object
+     */
+    protected function createBreadcrumbsManager(Application $sandbox): object
+    {
+        $managerClass = 'Diglactic\\Breadcrumbs\\Manager';
+        $generatorClass = 'Diglactic\\Breadcrumbs\\Generator';
+
+        if ($this->app->bound($managerClass) && is_object($baseManager = $this->app->make($managerClass))) {
+            $manager = clone $baseManager;
+        } else {
+            return new $managerClass(
+                $this->createBreadcrumbsGenerator($sandbox, $generatorClass),
+                $sandbox->make('router'),
+                $sandbox->make(\Illuminate\Contracts\View\Factory::class),
+            );
+        }
+
+        $this->setObjectProperty($manager, 'generator', $this->createBreadcrumbsGenerator($sandbox, $generatorClass));
+        $this->setObjectProperty($manager, 'router', $sandbox->make('router'));
+        $this->setObjectProperty($manager, 'viewFactory', $sandbox->make(\Illuminate\Contracts\View\Factory::class));
+        $this->setObjectProperty($manager, 'route', null);
+
+        return $manager;
+    }
+
+    /**
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @param  class-string  $generatorClass
+     * @return object
+     */
+    protected function createBreadcrumbsGenerator(Application $sandbox, string $generatorClass): object
+    {
+        if ($sandbox->bound($generatorClass)) {
+            return $sandbox->make($generatorClass);
+        }
+
+        return new $generatorClass;
+    }
+
+    /**
+     * Install a coroutine-aware proxy for Sentry's static current hub.
+     *
+     * The Sentry PHP SDK keeps the active hub in a static property. Sentry's
+     * Laravel Octane integration pushes/pops scopes around requests, which is
+     * safe for sequential workers but can corrupt scope stacks when multiple
+     * Swoole coroutines run in the same worker. The proxy stays global while
+     * delegating every SDK call to a hub stored in the current coroutine context.
+     */
+    protected function initializeSentryHubForCoroutine(): void
+    {
+        if (! class_exists('Sentry\\SentrySdk')
+            || ! interface_exists('Sentry\\State\\HubInterface')
+            || ! class_exists('Sentry\\State\\Hub')) {
+            return;
+        }
+
+        if (! $this->app->bound('sentry') && ! $this->app->bound('Sentry\\State\\HubInterface')) {
+            return;
+        }
+
+        $currentHub = \Sentry\SentrySdk::getCurrentHub();
+
+        if (! $currentHub instanceof SentryHubProxy) {
+            $currentHub = new SentryHubProxy($currentHub);
+            \Sentry\SentrySdk::setCurrentHub($currentHub);
+        }
+
+        $currentHub->seedCurrentCoroutineHub();
+    }
+
+    /**
+     * Determine if the binding is Sentry's hub/facade binding.
+     */
+    protected function isSentryHubBinding(string $key): bool
+    {
+        return in_array($key, [
+            'sentry',
+            'Sentry\\State\\HubInterface',
+        ], true)
+            && class_exists('Sentry\\SentrySdk')
+            && interface_exists('Sentry\\State\\HubInterface');
+    }
+
+    /**
+     * Resolve the global Sentry proxy. Its method calls delegate to the
+     * coroutine-local hub seeded when the request scope was created.
+     *
+     * @return object
+     */
+    protected function createSentryHub(): object
+    {
+        $this->initializeSentryHubForCoroutine();
+
+        return \Sentry\SentrySdk::getCurrentHub();
+    }
+
+    /**
+     * Determine if the binding is Sentry's tracing middleware.
+     */
+    protected function isSentryTracingMiddlewareBinding(string $key): bool
+    {
+        return $key === 'Sentry\\Laravel\\Tracing\\Middleware'
+            && class_exists($key);
+    }
+
+    /**
+     * Create a fresh Sentry tracing middleware for the current request.
+     *
+     * Sentry registers this middleware as a singleton and stores the active
+     * transaction, app span, and route-match flag on the object. Those fields
+     * must not be shared by concurrent coroutines.
+     *
+     * @return object
+     */
+    protected function createSentryTracingMiddleware(): object
+    {
+        $middlewareClass = 'Sentry\\Laravel\\Tracing\\Middleware';
+        $continueAfterResponse = true;
+
+        if ($this->app->bound($middlewareClass) && is_object($baseMiddleware = $this->app->make($middlewareClass))) {
+            $configured = $this->getObjectProperty($baseMiddleware, 'continueAfterResponse');
+
+            if (is_bool($configured)) {
+                $continueAfterResponse = $configured;
+            }
+        }
+
+        $middleware = new $middlewareClass($continueAfterResponse);
+
+        $this->setObjectProperty($middleware, 'transaction', null);
+        $this->setObjectProperty($middleware, 'appSpan', null);
+        $this->setObjectProperty($middleware, 'bootedTimestamp', null);
+        $this->setObjectProperty($middleware, 'didRouteMatch', false);
+
+        return $middleware;
     }
 
     /**
@@ -339,6 +595,22 @@ class RequestScope
                 'translator',
                 \Illuminate\Contracts\Translation\Translator::class,
                 \Illuminate\Translation\Translator::class,
+            ], $resolved),
+            'Laravel\\Socialite\\Contracts\\Factory',
+            'Laravel\\Socialite\\SocialiteManager' => $this->storeScopedAliases([
+                'Laravel\\Socialite\\Contracts\\Factory',
+                'Laravel\\Socialite\\SocialiteManager',
+            ], $resolved),
+            'Diglactic\\Breadcrumbs\\Manager' => $this->storeScopedAliases([
+                'Diglactic\\Breadcrumbs\\Manager',
+            ], $resolved),
+            'sentry',
+            'Sentry\\State\\HubInterface' => $this->storeScopedAliases([
+                'sentry',
+                'Sentry\\State\\HubInterface',
+            ], $resolved),
+            'Sentry\\Laravel\\Tracing\\Middleware' => $this->storeScopedAliases([
+                'Sentry\\Laravel\\Tracing\\Middleware',
             ], $resolved),
             default => null,
         };
