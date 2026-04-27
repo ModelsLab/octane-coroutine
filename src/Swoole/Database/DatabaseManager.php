@@ -20,6 +20,10 @@ class DatabaseManager extends BaseDatabaseManager
             return parent::connection($name);
         }
 
+        if (! $this->shouldPoolConnection($name)) {
+            return parent::connection($name);
+        }
+
         // Check if we already have a connection for this coroutine
         $contextKey = "db.connection.{$name}";
         $connection = Context::get($contextKey);
@@ -63,6 +67,13 @@ class DatabaseManager extends BaseDatabaseManager
             );
         }
         return $this->pools[$name];
+    }
+
+    protected function shouldPoolConnection(string $name): bool
+    {
+        $driver = $this->configuration($name)['driver'] ?? null;
+
+        return in_array($driver, ['mysql', 'mariadb', 'pgsql', 'sqlite', 'sqlsrv'], true);
     }
 
     protected function syncApplication(): void

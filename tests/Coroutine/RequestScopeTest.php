@@ -2,7 +2,10 @@
 
 namespace Tests\Coroutine;
 
+use Illuminate\Auth\AuthManager;
+use Illuminate\Config\Repository;
 use Illuminate\Foundation\Application;
+use Illuminate\Http\Request;
 use Laravel\Octane\Swoole\Coroutine\RequestScope;
 use PHPUnit\Framework\TestCase;
 
@@ -163,5 +166,112 @@ class RequestScopeTest extends TestCase
 
         $this->assertTrue($scope->has('cookie'));
         $this->assertNull($scope->get('cookie'));
+    }
+
+    public function test_cloned_auth_manager_resolves_users_from_the_cloned_guard(): void
+    {
+        $app = new Application(__DIR__);
+        $app->instance('auth', new RequestScopeFakeAuthManager($app));
+
+        $scope = new RequestScope($app);
+        $auth = $scope->resolve('auth', $app);
+
+        $auth->attempt(['id' => 123]);
+
+        $resolver = $auth->userResolver();
+
+        $this->assertSame(123, $resolver()->id);
+    }
+
+    public function test_cloned_auth_manager_custom_request_guards_use_scoped_request(): void
+    {
+        $baseApp = new Application(__DIR__);
+        $baseApp->instance('config', new Repository([
+            'auth' => [
+                'defaults' => [
+                    'guard' => 'api',
+                    'provider' => null,
+                ],
+                'guards' => [
+                    'api' => [
+                        'driver' => 'api-key',
+                    ],
+                ],
+            ],
+        ]));
+        $baseApp->instance('request', Request::create('/base', 'POST', ['key' => 'base-key']));
+
+        $baseAuth = new AuthManager($baseApp);
+        $baseAuth->viaRequest('api-key', static function (Request $request) {
+            return (object) [
+                'key' => $request->input('key'),
+                'path' => $request->path(),
+            ];
+        });
+        $baseApp->instance('auth', $baseAuth);
+
+        $scopedRequest = Request::create('/scoped', 'POST', ['key' => 'scoped-key']);
+        $sandbox = new Application(__DIR__);
+        $sandbox->instance('config', $baseApp->make('config'));
+        $sandbox->instance('request', $scopedRequest);
+
+        $scope = new RequestScope($baseApp, $scopedRequest);
+        $auth = $scope->resolve('auth', $sandbox);
+        $user = $auth->guard('api')->user();
+
+        $this->assertSame('scoped-key', $user->key);
+        $this->assertSame('scoped', $user->path);
+    }
+}
+
+class RequestScopeFakeAuthManager
+{
+    private $userResolver;
+
+    public ?object $user = null;
+
+    public function __construct(public Application $app)
+    {
+        $this->userResolver = fn ($guard = null) => $this->guard($guard)->user();
+    }
+
+    public function setApplication(Application $app): static
+    {
+        $this->app = $app;
+
+        return $this;
+    }
+
+    public function resolveUsersUsing(\Closure $userResolver): static
+    {
+        $this->userResolver = $userResolver;
+
+        return $this;
+    }
+
+    public function forgetGuards(): void
+    {
+    }
+
+    public function guard($guard = null): static
+    {
+        return $this;
+    }
+
+    public function attempt(array $credentials): bool
+    {
+        $this->user = (object) ['id' => $credentials['id']];
+
+        return true;
+    }
+
+    public function user(): ?object
+    {
+        return $this->user;
+    }
+
+    public function userResolver(): \Closure
+    {
+        return $this->userResolver;
     }
 }

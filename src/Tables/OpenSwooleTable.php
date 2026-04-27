@@ -33,8 +33,8 @@ class OpenSwooleTable extends Table
     {
         $callback = $this->ensureColumnsSize();
 
-        foreach ($values as $key => $value) {
-            $callback($value, $key);
+        foreach ($values as $column => $value) {
+            $callback($value, $column);
         }
 
         return parent::set($key, $values);

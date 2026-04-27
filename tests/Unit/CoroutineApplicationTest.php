@@ -149,6 +149,27 @@ class CoroutineApplicationTest extends TestCase
         $this->assertSame('valid@example.com', $request->validated('email'));
         $this->assertSame('secret-password', $request->validated('password'));
     }
+
+    public function test_scoped_request_instances_fire_base_rebinding_callbacks(): void
+    {
+        $base = new Application(__DIR__);
+        $base->instance('request', Request::create('/base'));
+
+        $base->rebinding('request', function ($app, Request $request) {
+            $request->setUserResolver(fn () => new CoroutineApplicationRequestUserProbe(1));
+            $request->attributes->set('resolved_path', $app->make('request')->path());
+        });
+
+        $proxy = new CoroutineApplication($base);
+        $request = Request::create('/login', 'POST');
+
+        Context::set('octane.request_scope', new RequestScope($base));
+
+        $proxy->instance('request', $request);
+
+        $this->assertSame(1, $request->user()->verified);
+        $this->assertSame('login', $request->attributes->get('resolved_path'));
+    }
 }
 
 class CoroutineApplicationBuildRequestProbe
@@ -180,5 +201,12 @@ class CoroutineApplicationLoginFormRequestProbe extends FormRequest
             'email' => ['required', 'email'],
             'password' => ['required', 'string', 'min:6'],
         ];
+    }
+}
+
+class CoroutineApplicationRequestUserProbe
+{
+    public function __construct(public int $verified)
+    {
     }
 }

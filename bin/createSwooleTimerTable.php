@@ -1,25 +1,16 @@
 <?php
 
+use Laravel\Octane\Swoole\TimerTableSize;
 use Laravel\Octane\Tables\TableFactory;
 use Swoole\Table;
 
 require_once __DIR__.'/../src/Tables/TableFactory.php';
+require_once __DIR__.'/../src/Swoole/TimerTableSize.php';
 
 if (($serverState['octaneConfig']['max_execution_time'] ?? 0) > 0) {
-    $poolSize = $serverState['octaneConfig']['swoole']['pool']['size'] ?? 10;
-    $workerNum = $serverState['octaneConfig']['swoole']['options']['worker_num'] ?? 4;
+    $timerTableSize = TimerTableSize::fromServerState($serverState);
 
-    // Calculate recommended size: pool_size * worker_num * 2 (for safety margin)
-    $recommendedSize = $poolSize * $workerNum * 2;
-
-    // Use configured size or fall back to recommended, with minimum of 1000
-    $configuredSize = $serverState['octaneConfig']['max_timer_table_size'] ?? null;
-    $timerTableSize = $configuredSize ?? max(1000, $recommendedSize);
-
-    // Ensure minimum reasonable size
-    $timerTableSize = max($timerTableSize, 1000);
-
-    error_log("📊 Creating timer table with size: {$timerTableSize} (pool: {$poolSize}, workers: {$workerNum})");
+    error_log("📊 Creating timer table with size: {$timerTableSize}");
 
     $timerTable = TableFactory::make($timerTableSize);
 

@@ -58,6 +58,7 @@ class CoroutineApplication extends Application
         $this->beforeResolvingCallbacks = $app->beforeResolvingCallbacks;
         $this->resolvingCallbacks = $app->resolvingCallbacks;
         $this->afterResolvingCallbacks = $app->afterResolvingCallbacks;
+        $this->reboundCallbacks = $app->reboundCallbacks;
 
         if (property_exists($app, 'afterResolvingAttributeCallbacks')
             && property_exists($this, 'afterResolvingAttributeCallbacks')) {
@@ -316,6 +317,8 @@ class CoroutineApplication extends Application
 
         if ($scope instanceof RequestScope && is_string($abstract = $this->normalizeAbstract($abstract))) {
             $scope->set($abstract, $instance);
+
+            $this->rebound($abstract);
 
             return $instance;
         }

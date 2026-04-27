@@ -521,11 +521,55 @@ class RequestScope
             $auth->setApplication($sandbox);
         }
 
+        $this->rebindAuthCustomCreators($auth);
+
+        if (method_exists($auth, 'resolveUsersUsing')) {
+            $auth->resolveUsersUsing(fn ($guard = null) => $auth->guard($guard)->user());
+        }
+
         if (method_exists($auth, 'forgetGuards')) {
             $auth->forgetGuards();
         }
 
         return $auth;
+    }
+
+    /**
+     * Rebind custom guard creators cloned from the base AuthManager.
+     *
+     * Auth::viaRequest() registers a closure that reads $this->app['request'].
+     * Cloning the AuthManager does not rebind that closure's $this, so custom
+     * request guards would keep using the worker's base request unless we bind
+     * those creators to the coroutine-local clone.
+     *
+     * @param  object  $auth
+     * @return void
+     */
+    protected function rebindAuthCustomCreators(object $auth): void
+    {
+        $customCreators = $this->getObjectProperty($auth, 'customCreators');
+
+        if (! is_array($customCreators)) {
+            return;
+        }
+
+        foreach ($customCreators as $driver => $creator) {
+            if (! $creator instanceof Closure) {
+                continue;
+            }
+
+            $reflection = new \ReflectionFunction($creator);
+            if ($reflection->isStatic()) {
+                continue;
+            }
+
+            $bound = $creator->bindTo($auth, $auth::class);
+            if ($bound instanceof Closure) {
+                $customCreators[$driver] = $bound;
+            }
+        }
+
+        $this->setObjectProperty($auth, 'customCreators', $customCreators);
     }
 
     /**
@@ -895,6 +939,35 @@ class RequestScope
             $instanceProperty->setValue($object, $value);
         } catch (ReflectionException) {
             // If the implementation changes upstream, fall back gracefully.
+        }
+    }
+
+    /**
+     * Get a protected property from an object and its parent classes.
+     *
+     * @param  object  $object
+     * @param  string  $property
+     * @return mixed
+     */
+    protected function getObjectProperty(object $object, string $property)
+    {
+        try {
+            $reflection = new ReflectionClass($object);
+
+            while (! $reflection->hasProperty($property) && $reflection->getParentClass()) {
+                $reflection = $reflection->getParentClass();
+            }
+
+            if (! $reflection->hasProperty($property)) {
+                return null;
+            }
+
+            $instanceProperty = $reflection->getProperty($property);
+            $instanceProperty->setAccessible(true);
+
+            return $instanceProperty->getValue($object);
+        } catch (ReflectionException) {
+            return null;
         }
     }
 
