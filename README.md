@@ -122,7 +122,8 @@ Edit `config/octane.php` if needed:
     'options' => [
         'enable_coroutine' => true,  // Already enabled by default
         'worker_num' => 32,
-        'max_request' => 500,
+        'max_request' => 10000,
+        'max_request_grace' => 1000,
     ],
 ],
 ```

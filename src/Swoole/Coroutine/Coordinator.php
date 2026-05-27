@@ -2,6 +2,7 @@
 
 namespace Laravel\Octane\Swoole\Coroutine;
 
+use Swoole\Coroutine;
 use Swoole\Coroutine\Channel;
 
 /**
@@ -57,6 +58,10 @@ class Coordinator
         }
         
         $this->resumed = true;
+
+        if (Coroutine::getCid() <= 0) {
+            return;
+        }
         
         // Push to channel to wake up waiting coroutines
         // Using errSilent to avoid "channel is full" errors
@@ -81,6 +86,10 @@ class Coordinator
     public function reset(): void
     {
         $this->resumed = false;
+
+        if (Coroutine::getCid() <= 0) {
+            return;
+        }
         
         // Drain the channel
         while ($this->channel->length() > 0) {

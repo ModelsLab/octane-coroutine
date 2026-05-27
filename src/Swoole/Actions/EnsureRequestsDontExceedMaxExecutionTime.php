@@ -20,8 +20,10 @@ class EnsureRequestsDontExceedMaxExecutionTime
         protected SwooleExtension $extension,
         protected $timerTable,
         protected $maxExecutionTime,
-        protected ?Server $server = null
+        protected ?Server $server = null,
+        protected int|string|null $fallbackSignal = SIGTERM,
     ) {
+        $this->fallbackSignal = self::normalizeFallbackSignal($this->fallbackSignal);
     }
 
     /**
@@ -59,10 +61,11 @@ class EnsureRequestsDontExceedMaxExecutionTime
             $cancelled = $this->cancelCoroutine($coroutineId);
 
             if (!$cancelled) {
-                // If coroutine cancellation failed, fall back to worker kill
-                // This is a last resort that will drop all concurrent requests
-                error_log("⚠️ Failed to cancel coroutine #{$coroutineId}, falling back to worker SIGKILL (PID: {$row['worker_pid']})");
-                $this->extension->dispatchProcessSignal($row['worker_pid'], SIGKILL);
+                // If coroutine cancellation failed, ask Swoole to recycle the
+                // worker. SIGTERM is the default so active request cleanup has
+                // a chance to run; SIGKILL remains configurable as a last resort.
+                error_log("⚠️ Failed to cancel coroutine #{$coroutineId}, falling back to worker {$this->fallbackSignalName()} (PID: {$row['worker_pid']})");
+                $this->extension->dispatchProcessSignal($row['worker_pid'], $this->fallbackSignal);
             }
 
             // Try to send a 408 timeout response
@@ -121,5 +124,24 @@ class EnsureRequestsDontExceedMaxExecutionTime
             error_log("❌ Error cancelling coroutine #{$coroutineId}: " . $e->getMessage());
             return false;
         }
+    }
+
+    public static function normalizeFallbackSignal(int|string|null $signal): int
+    {
+        if (is_int($signal)) {
+            return in_array($signal, [SIGTERM, SIGKILL], true) ? $signal : SIGTERM;
+        }
+
+        $signal = strtoupper(trim((string) $signal));
+
+        return match ($signal) {
+            'KILL', 'SIGKILL', (string) SIGKILL => SIGKILL,
+            default => SIGTERM,
+        };
+    }
+
+    protected function fallbackSignalName(): string
+    {
+        return $this->fallbackSignal === SIGKILL ? 'SIGKILL' : 'SIGTERM';
     }
 }

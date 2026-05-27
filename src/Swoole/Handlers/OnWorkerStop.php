@@ -68,7 +68,12 @@ class OnWorkerStop
                 error_log("⏳ {$workerType} #{$workerId} still waiting: {$activeRequests} requests active (waited: {$waited}s)");
             }
 
-            Coroutine::sleep($checkInterval);
+            if (Coroutine::getCid() > 0) {
+                Coroutine::sleep($checkInterval);
+            } else {
+                usleep((int) ($checkInterval * 1000000));
+            }
+
             $waited += $checkInterval;
         }
 

@@ -27,6 +27,7 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
                     {--workers=auto : The number of workers that should be available to handle requests}
                     {--task-workers=auto : The number of task workers that should be available to handle tasks}
                     {--max-requests=500 : The number of requests to process before reloading the server}
+                    {--max-request-grace= : Additional randomized request count before recycling each worker}
                     {--pool= : The number of application instances in the coroutine pool}
                     {--watch : Automatically reload the server when the application is modified}
                     {--poll : Use file system polling while watching in order to watch files over a network}';
@@ -111,11 +112,13 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
         
         $serverStateFile->writeState([
             'appName' => config('app.name', 'Laravel'),
+            'starterProcessId' => getmypid(),
             'host' => $this->getHost(),
             'port' => $this->getPort(),
             'workers' => $this->workerCount($extension),
             'taskWorkers' => $this->taskWorkerCount($extension),
             'maxRequests' => $this->option('max-requests'),
+            'maxRequestGrace' => $this->maxRequestGrace(),
             'publicPath' => public_path(),
             'storagePath' => storage_path(),
             'defaultServerOptions' => $this->defaultServerOptions($extension),
@@ -155,6 +158,9 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
             
             // Max requests per worker before restart (prevents memory leaks)
             'max_request' => $this->option('max-requests'),
+
+            // Randomize worker recycling so all busy workers do not restart together.
+            'max_request_grace' => $this->maxRequestGrace(),
             
             // Max size of request/response package (10MB)
             'package_max_length' => 10 * 1024 * 1024,
@@ -189,6 +195,9 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
             
             // Max requests per task worker before restart
             'task_max_request' => $this->option('max-requests'),
+
+            // Randomize task worker recycling as well.
+            'task_max_request_grace' => $this->maxRequestGrace(),
             
             // Number of task workers
             'task_worker_num' => $this->taskWorkerCount($extension),
@@ -237,6 +246,27 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
         $tickEnabled = config('octane.swoole.tick', false);
         
         return $tickEnabled ? 1 : 0;
+    }
+
+    protected function maxRequestGrace(): int
+    {
+        $configured = $this->option('max-request-grace');
+
+        if ($configured === null || $configured === '') {
+            $configured = config('octane.swoole.max_request_grace');
+        }
+
+        if ($configured !== null && $configured !== '') {
+            return max(0, (int) $configured);
+        }
+
+        $maxRequests = max(0, (int) $this->option('max-requests'));
+
+        if ($maxRequests === 0) {
+            return 0;
+        }
+
+        return max(1, min(1000, (int) floor($maxRequests * 0.1)));
     }
 
     /**

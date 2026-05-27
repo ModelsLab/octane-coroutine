@@ -67,6 +67,7 @@ class OctaneServiceProvider extends ServiceProvider
                 $app->make(SignalDispatcher::class),
                 $app->make(SwooleServerStateFile::class),
                 $app->make(Exec::class),
+                (int) $app['config']->get('octane.swoole.shutdown_timeout', 30),
             );
         });
 

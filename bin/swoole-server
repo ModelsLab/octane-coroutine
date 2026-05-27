@@ -59,7 +59,9 @@ $server->on('start', fn (Server $server) => $bootstrap($serverState) && (new OnS
     $serverState['appName'],
     $serverState['octaneConfig']['max_execution_time'] ?? 0,
     $timerTable,
-    $serverState['octaneConfig']['tick'] ?? true
+    $serverState['octaneConfig']['swoole']['tick'] ?? false,
+    true,
+    $serverState['octaneConfig']['swoole']['timeout_fallback_signal'] ?? SIGTERM
 ))($server));
 
 $server->on('managerstart', function () use ($serverState) {

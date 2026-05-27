@@ -35,7 +35,7 @@ class EnsureRequestsDontExceedMaxExecutionTimeTest extends TestCase
         $this->assertSame([123], $table->deletedIds);
     }
 
-    public function test_timeout_falls_back_to_worker_kill_when_cancel_fails(): void
+    public function test_timeout_falls_back_to_worker_sigterm_when_cancel_fails(): void
     {
         $table = new FakeTimerTable([
             55 => [
@@ -56,8 +56,33 @@ class EnsureRequestsDontExceedMaxExecutionTimeTest extends TestCase
         $action->__invoke();
 
         $this->assertSame([55], $action->cancelledIds);
-        $this->assertSame([[222, SIGKILL]], $extension->signals);
+        $this->assertSame([[222, SIGTERM]], $extension->signals);
         $this->assertSame([55], $table->deletedIds);
+    }
+
+    public function test_timeout_fallback_can_still_be_configured_to_sigkill(): void
+    {
+        $table = new FakeTimerTable([
+            56 => [
+                'worker_pid' => 223,
+                'time' => time() - 20,
+                'fd' => 10,
+            ],
+        ]);
+
+        $extension = new RecordingSwooleExtension();
+        $action = new TestableEnsureRequestsDontExceedMaxExecutionTime(
+            $extension,
+            $table,
+            5,
+            null,
+            'SIGKILL',
+        );
+        $action->cancelResult = false;
+
+        $action->__invoke();
+
+        $this->assertSame([[223, SIGKILL]], $extension->signals);
     }
 
     public function test_non_expired_requests_are_ignored(): void

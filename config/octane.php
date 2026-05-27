@@ -220,6 +220,18 @@ return [
 
         /*
         |--------------------------------------------------------------------------
+        | Worker Recycling Grace
+        |--------------------------------------------------------------------------
+        |
+        | Swoole adds a random value from 0 to this number to max_request so
+        | workers do not all recycle at the same request count under bursts.
+        |
+        */
+
+        'max_request_grace' => env('OCTANE_MAX_REQUEST_GRACE', null),
+
+        /*
+        |--------------------------------------------------------------------------
         | Graceful Shutdown Timeout
         |--------------------------------------------------------------------------
         |
@@ -230,6 +242,19 @@ return [
         */
         
         'shutdown_timeout' => env('OCTANE_SHUTDOWN_TIMEOUT', 30),
+
+        /*
+        |--------------------------------------------------------------------------
+        | Request Timeout Fallback Signal
+        |--------------------------------------------------------------------------
+        |
+        | If coroutine cancellation fails after max_execution_time, prefer
+        | SIGTERM so Swoole can recycle the worker gracefully. Set to SIGKILL
+        | only when a deployment intentionally wants the old hard-kill behavior.
+        |
+        */
+
+        'timeout_fallback_signal' => env('OCTANE_TIMEOUT_FALLBACK_SIGNAL', 'SIGTERM'),
     ],
 
     /*

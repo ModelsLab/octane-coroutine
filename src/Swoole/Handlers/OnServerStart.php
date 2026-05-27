@@ -16,8 +16,10 @@ class OnServerStart
         protected int $maxExecutionTime,
         protected $timerTable,
         protected bool $shouldTick = true,
-        protected bool $shouldSetProcessName = true
+        protected bool $shouldSetProcessName = true,
+        protected int|string|null $timeoutFallbackSignal = SIGTERM
     ) {
+        $this->timeoutFallbackSignal = EnsureRequestsDontExceedMaxExecutionTime::normalizeFallbackSignal($this->timeoutFallbackSignal);
     }
 
     /**
@@ -59,7 +61,7 @@ class OnServerStart
         if ($this->maxExecutionTime > 0) {
             Timer::tick(1000, function () use ($server) {
                 (new EnsureRequestsDontExceedMaxExecutionTime(
-                    $this->extension, $this->timerTable, $this->maxExecutionTime, $server
+                    $this->extension, $this->timerTable, $this->maxExecutionTime, $server, $this->timeoutFallbackSignal
                 ))();
             });
         }

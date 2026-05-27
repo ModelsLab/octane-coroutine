@@ -25,6 +25,7 @@ class StartCommand extends Command implements SignalableCommandInterface
                     {--workers= : The number of workers that should be available to handle requests}
                     {--task-workers= : The number of task workers that should be available to handle tasks}
                     {--max-requests= : The number of requests to process before reloading the server}
+                    {--max-request-grace= : Additional randomized request count before recycling each Swoole worker}
                     {--rr-config= : The path to the RoadRunner .rr.yaml file}
                     {--caddyfile= : The path to the FrankenPHP Caddyfile file}
                     {--https : Enable HTTPS, HTTP/2, and HTTP/3, and automatically generate and renew certificates [FrankenPHP only]}
@@ -70,6 +71,9 @@ class StartCommand extends Command implements SignalableCommandInterface
             '--workers' => $this->option('workers') ?: config('octane.workers', 'auto'),
             '--task-workers' => $this->option('task-workers') ?: config('octane.task_workers', 'auto'),
             '--max-requests' => $this->option('max-requests') ?: config('octane.max_requests', 500),
+            '--max-request-grace' => $this->option('max-request-grace') !== null && $this->option('max-request-grace') !== ''
+                ? $this->option('max-request-grace')
+                : config('octane.swoole.max_request_grace'),
             '--watch' => $this->option('watch'),
             '--poll' => $this->option('poll'),
         ]);
