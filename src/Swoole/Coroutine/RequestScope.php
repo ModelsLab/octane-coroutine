@@ -1065,6 +1065,7 @@ class RequestScope
         /** @var \Illuminate\View\Factory $view */
         $view = clone $this->app->make('view');
         $view->setContainer($sandbox);
+        $view->share('__env', $view);
         $view->share('app', $sandbox);
         $view->flushState();
 
