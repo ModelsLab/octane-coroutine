@@ -22,6 +22,7 @@ use RuntimeException;
 use Throwable;
 use Laravel\Octane\Swoole\Coroutine\Context;
 use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
+use Laravel\Octane\Swoole\Coroutine\LivewireCoroutineMutex;
 use Laravel\Octane\Swoole\Coroutine\RequestScope;
 use Swoole\Coroutine;
 use Illuminate\Support\Facades\Facade;
@@ -135,6 +136,10 @@ class Worker implements WorkerContract
             $this->handleWorkerError($e, $sandbox, $request, $context, $responded);
         } finally {
             if ($inCoroutine) {
+                if ($sandbox->bound(LivewireCoroutineMutex::class)) {
+                    $sandbox->make(LivewireCoroutineMutex::class)->releaseAllForCurrentCoroutine();
+                }
+
                 // Release coroutine-local database connections before flushing
                 // request scope. Flushing first can drop the context references
                 // needed by the pool, leaving its counters exhausted while PDOs

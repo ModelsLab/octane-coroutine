@@ -22,6 +22,7 @@ use Laravel\Octane\FrankenPhp\ServerProcessInspector as FrankenPhpServerProcessI
 use Laravel\Octane\FrankenPhp\ServerStateFile as FrankenPhpServerStateFile;
 use Laravel\Octane\RoadRunner\ServerProcessInspector as RoadRunnerServerProcessInspector;
 use Laravel\Octane\RoadRunner\ServerStateFile as RoadRunnerServerStateFile;
+use Laravel\Octane\Swoole\Coroutine\LivewireCoroutineMutex;
 use Laravel\Octane\Swoole\ServerProcessInspector as SwooleServerProcessInspector;
 use Laravel\Octane\Swoole\ServerStateFile as SwooleServerStateFile;
 use Laravel\Octane\Swoole\SignalDispatcher;
@@ -42,6 +43,7 @@ class OctaneServiceProvider extends ServiceProvider
         $this->bindListeners();
 
         $this->app->singleton('octane', Octane::class);
+        $this->app->singleton(LivewireCoroutineMutex::class);
 
         $this->app->singleton('db', function ($app) {
             return new \Laravel\Octane\Swoole\Database\DatabaseManager($app, $app['db.factory']);
@@ -117,6 +119,7 @@ class OctaneServiceProvider extends ServiceProvider
         $this->registerCommands();
         $this->registerHttpTaskHandlingRoutes();
         $this->registerPublishing();
+        $this->registerLivewireCoroutineMutex();
     }
 
     /**
@@ -157,6 +160,27 @@ class OctaneServiceProvider extends ServiceProvider
         $this->app->singleton(Listeners\PrepareSocialiteForNextOperation::class);
         $this->app->singleton(Listeners\ReportException::class);
         $this->app->singleton(Listeners\StopWorkerIfNecessary::class);
+    }
+
+    protected function registerLivewireCoroutineMutex(): void
+    {
+        $this->app->booted(function (): void {
+            if (! function_exists('Livewire\\before') || ! function_exists('Livewire\\after')) {
+                return;
+            }
+
+            \Livewire\before('render', function (): void {
+                $this->app->make(LivewireCoroutineMutex::class)->acquire();
+            });
+
+            \Livewire\after('render', function () {
+                return function ($html) {
+                    $this->app->make(LivewireCoroutineMutex::class)->release();
+
+                    return $html;
+                };
+            });
+        });
     }
 
     /**
