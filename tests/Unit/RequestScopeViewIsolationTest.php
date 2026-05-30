@@ -41,7 +41,9 @@ class RequestScopeViewIsolationTest extends TestCase
 
             $this->assertSame('alpha', $firstView->shared('request_id'));
             $this->assertSame('global', $firstView->shared('boot_only'));
+            $this->assertSame($firstView, $firstView->shared('__env'));
             $this->assertSame($sandbox, $firstView->shared('app'));
+            $this->assertSame($base->make('view'), $base->make('view')->shared('__env'));
             $this->assertNull($base->make('view')->shared('request_id'));
         } finally {
             Context::clear();
@@ -56,6 +58,7 @@ class RequestScopeViewIsolationTest extends TestCase
             $this->assertSame('global', $secondView->shared('boot_only'));
             $this->assertNull($secondView->shared('request_id'));
             $this->assertNull($base->make('view')->shared('request_id'));
+            $this->assertSame($secondView, $secondView->shared('__env'));
             $this->assertSame($secondView, $sandbox->make(ViewFactoryContract::class));
         } finally {
             Context::clear();
