@@ -143,7 +143,7 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
      */
     protected function defaultServerOptions(SwooleExtension $extension)
     {
-        return array_merge([
+        $options = array_merge([
             // Enable coroutine support for async I/O operations
             'enable_coroutine' => true,
             
@@ -156,11 +156,14 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
             // Log level: INFO in local, ERROR in production for better performance
             'log_level' => app()->environment('local') ? SWOOLE_LOG_INFO : SWOOLE_LOG_ERROR,
             
-            // Max requests per worker before restart (prevents memory leaks)
-            'max_request' => $this->option('max-requests'),
+            // Disable Swoole's built-in HTTP worker recycling. In coroutine
+            // mode it can close an upstream request while Nginx is still
+            // reading the response. The bin/swoole-server request loop applies
+            // the same max-requests limit cooperatively after response cleanup.
+            'max_request' => 0,
 
-            // Randomize worker recycling so all busy workers do not restart together.
-            'max_request_grace' => $this->maxRequestGrace(),
+            // Randomization is applied by the cooperative recycler.
+            'max_request_grace' => 0,
             
             // Max size of request/response package (10MB)
             'package_max_length' => 10 * 1024 * 1024,
@@ -205,6 +208,13 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
             // Number of worker processes
             'worker_num' => $this->workerCount($extension),
         ], config('octane.swoole.options', []));
+
+        // Keep HTTP worker recycling under the cooperative request-loop guard
+        // even when applications publish custom low-level Swoole options.
+        $options['max_request'] = 0;
+        $options['max_request_grace'] = 0;
+
+        return $options;
     }
 
     /**

@@ -9,6 +9,7 @@ use Laravel\Octane\Swoole\Handlers\OnWorkerStop;
 use Laravel\Octane\Swoole\ServerStateFile;
 use Laravel\Octane\Swoole\SwooleExtension;
 use Laravel\Octane\Swoole\WorkerState;
+use Laravel\Octane\Swoole\Actions\StopWorkerIfMaxRequestsExceeded;
 use Laravel\Octane\Swoole\Coroutine\Context;
 use Laravel\Octane\Swoole\Coroutine\Monitor;
 use Swoole\Coroutine;
@@ -194,6 +195,8 @@ $server->on('request', function ($request, $response) use ($server, $workerState
         }
 
         Monitor::unregisterRequestCoroutine($cid);
+
+        (new StopWorkerIfMaxRequestsExceeded($server, $workerState))();
 
         // Ensure coroutine context is cleared (Swoole does this automatically, but explicit is safe)
         Context::clear();

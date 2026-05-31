@@ -81,6 +81,59 @@ class OnWorkerStartPoolFreeTest extends TestCase
         $this->assertSame($this->app, $container->getBaseApplication());
         $this->assertSame($container, $handler->preparedSandbox);
     }
+
+    public function test_http_worker_uses_cooperative_max_request_limit_with_grace(): void
+    {
+        $workerState = new \Laravel\Octane\Swoole\WorkerState();
+        $handler = $this->makeHandler($workerState, [
+            'maxRequests' => 500,
+            'maxRequestGrace' => 1000,
+        ]);
+
+        $handler->configureCooperativeMaxRequestsForTest((object) ['setting' => ['worker_num' => 4]], 1);
+
+        $this->assertSame(0, $workerState->handledRequests);
+        $this->assertGreaterThanOrEqual(500, $workerState->maxRequests);
+        $this->assertLessThanOrEqual(1500, $workerState->maxRequests);
+        $this->assertFalse($workerState->recycleRequested);
+        $this->assertFalse($workerState->recycleTriggered);
+    }
+
+    public function test_task_workers_do_not_use_http_cooperative_max_request_limit(): void
+    {
+        $workerState = new \Laravel\Octane\Swoole\WorkerState();
+        $handler = $this->makeHandler($workerState, [
+            'maxRequests' => 500,
+            'maxRequestGrace' => 1000,
+        ]);
+
+        $handler->configureCooperativeMaxRequestsForTest((object) ['setting' => ['worker_num' => 4]], 4);
+
+        $this->assertSame(0, $workerState->maxRequests);
+    }
+
+    private function makeHandler(\Laravel\Octane\Swoole\WorkerState $workerState, array $serverState): TestableOnWorkerStart
+    {
+        $fakeWorker = $this->createMock(Worker::class);
+        $fakeWorker->method('application')->willReturn($this->app);
+        $fakeWorker->method('getClient')->willReturn(new FakeClient([]));
+
+        return new TestableOnWorkerStart(
+            new SwooleExtension(),
+            $this->app->basePath(),
+            array_merge([
+                'appName' => 'octane-coroutine-test',
+                'octaneConfig' => [
+                    'swoole' => [
+                        'pool' => ['size' => 32],
+                    ],
+                ],
+            ], $serverState),
+            $workerState,
+            false,
+            $fakeWorker,
+        );
+    }
 }
 
 class TestableOnWorkerStart extends OnWorkerStart
@@ -104,6 +157,11 @@ class TestableOnWorkerStart extends OnWorkerStart
     public function bootHttpWorkerForTest($server, int $workerId): ?Worker
     {
         return $this->bootHttpWorker($server, $workerId);
+    }
+
+    public function configureCooperativeMaxRequestsForTest($server, int $workerId): void
+    {
+        $this->configureCooperativeMaxRequests($server, $workerId);
     }
 
     public function createPoolWorker($server, int $workerId, int $poolIndex): Worker
