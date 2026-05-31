@@ -5,11 +5,13 @@ namespace Laravel\Octane\Swoole\Coroutine;
 use Closure;
 use Illuminate\Contracts\Events\Dispatcher as EventDispatcher;
 use Illuminate\Cache\CacheManager;
+use Illuminate\Filesystem\FilesystemManager;
 use Illuminate\Foundation\Application;
 use Illuminate\Http\Request;
 use Illuminate\Queue\QueueManager;
 use Illuminate\Redis\RedisManager;
 use Illuminate\Session\SessionManager;
+use Illuminate\Support\Defer\DeferredCallbackCollection;
 use ReflectionClass;
 use ReflectionException;
 
@@ -21,8 +23,9 @@ use ReflectionException;
  * per-coroutine isolation (request, session, auth, config, url, cookie).
  *
  * Most process-scoped bindings remain on the shared base application.
- * Redis-backed managers are scoped because shared phpredis sockets are
- * not safe to reuse across concurrent coroutines in the same worker.
+ * Managers that cache network clients are scoped because shared phpredis,
+ * cURL, and filesystem/S3 handles are not safe to reuse across concurrent
+ * coroutines in the same worker.
  */
 class RequestScope
 {
@@ -288,6 +291,10 @@ class RequestScope
             'cache.store', \Illuminate\Contracts\Cache\Repository::class => $this->createCacheStore($sandbox),
             'config' => $this->cloneConfig(),
             'cookie' => $this->createCookieJar(),
+            DeferredCallbackCollection::class => new DeferredCallbackCollection,
+            'filesystem', FilesystemManager::class, \Illuminate\Contracts\Filesystem\Factory::class => $this->createFilesystemManager($sandbox),
+            'filesystem.disk', \Illuminate\Contracts\Filesystem\Filesystem::class => $this->createFilesystemDisk($sandbox),
+            'filesystem.cloud', \Illuminate\Contracts\Filesystem\Cloud::class => $this->createFilesystemCloud($sandbox),
             \Inertia\ResponseFactory::class => $this->createInertiaResponseFactory(),
             'log', \Psr\Log\LoggerInterface::class => $this->createLogManager($sandbox),
             'queue', QueueManager::class, \Illuminate\Contracts\Queue\Factory::class, \Illuminate\Contracts\Queue\Monitor::class => $this->createQueueManager($sandbox),
@@ -616,6 +623,26 @@ class RequestScope
             'Sentry\\Laravel\\Tracing\\Middleware' => $this->storeScopedAliases([
                 'Sentry\\Laravel\\Tracing\\Middleware',
             ], $resolved),
+            DeferredCallbackCollection::class => $this->storeScopedAliases([
+                DeferredCallbackCollection::class,
+            ], $resolved),
+            'filesystem',
+            FilesystemManager::class,
+            \Illuminate\Contracts\Filesystem\Factory::class => $this->storeScopedAliases([
+                'filesystem',
+                FilesystemManager::class,
+                \Illuminate\Contracts\Filesystem\Factory::class,
+            ], $resolved),
+            'filesystem.disk',
+            \Illuminate\Contracts\Filesystem\Filesystem::class => $this->storeScopedAliases([
+                'filesystem.disk',
+                \Illuminate\Contracts\Filesystem\Filesystem::class,
+            ], $resolved),
+            'filesystem.cloud',
+            \Illuminate\Contracts\Filesystem\Cloud::class => $this->storeScopedAliases([
+                'filesystem.cloud',
+                \Illuminate\Contracts\Filesystem\Cloud::class,
+            ], $resolved),
             'queue',
             QueueManager::class,
             \Illuminate\Contracts\Queue\Factory::class,
@@ -733,6 +760,12 @@ class RequestScope
                 return;
             }
 
+            if ($resource instanceof FilesystemManager) {
+                $this->releaseFilesystemManager($resource);
+
+                return;
+            }
+
             if ($resource instanceof QueueManager) {
                 $this->releaseQueueManager($resource);
 
@@ -795,6 +828,28 @@ class RequestScope
 
         if (is_string($default) && $default !== '') {
             $names[] = $default;
+        }
+
+        return array_values(array_unique(array_filter($names, 'is_string')));
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function filesystemDiskNames(): array
+    {
+        $config = $this->app->make('config');
+        $disks = $config->get('filesystems.disks', []);
+        $default = $config->get('filesystems.default');
+        $cloud = $config->get('filesystems.cloud');
+        $names = is_array($disks) ? array_keys($disks) : [];
+
+        if (is_string($default) && $default !== '') {
+            $names[] = $default;
+        }
+
+        if (is_string($cloud) && $cloud !== '') {
+            $names[] = $cloud;
         }
 
         return array_values(array_unique(array_filter($names, 'is_string')));
@@ -1082,6 +1137,52 @@ class RequestScope
     }
 
     /**
+     * Create an isolated filesystem manager for the current coroutine.
+     *
+     * FilesystemManager caches disk instances. S3 disks keep an AWS S3 client,
+     * which in turn owns a Guzzle CurlMultiHandler. Sharing those handles across
+     * coroutines can fatal while one request is still uploading.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return \Illuminate\Filesystem\FilesystemManager
+     */
+    protected function createFilesystemManager(Application $sandbox): FilesystemManager
+    {
+        $filesystem = clone $this->app->make('filesystem');
+
+        $this->setObjectProperty($filesystem, 'app', $sandbox);
+        $this->setObjectProperty($filesystem, 'disks', []);
+
+        return $filesystem;
+    }
+
+    /**
+     * Create the coroutine-local default filesystem disk.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createFilesystemDisk(Application $sandbox)
+    {
+        $filesystem = $this->resolve('filesystem', $sandbox);
+
+        return $filesystem?->disk();
+    }
+
+    /**
+     * Create the coroutine-local default cloud filesystem disk.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createFilesystemCloud(Application $sandbox)
+    {
+        $filesystem = $this->resolve('filesystem', $sandbox);
+
+        return $filesystem?->cloud();
+    }
+
+    /**
      * Create an isolated queue manager for the current coroutine.
      *
      * QueueManager caches resolved queue connections. RedisQueue then keeps a
@@ -1197,6 +1298,23 @@ class RequestScope
         }
 
         $this->setObjectProperty($queue, 'connections', []);
+    }
+
+    /**
+     * Release resolved filesystem disks owned by the request scope.
+     *
+     * @param  \Illuminate\Filesystem\FilesystemManager  $filesystem
+     * @return void
+     */
+    protected function releaseFilesystemManager(FilesystemManager $filesystem): void
+    {
+        if (method_exists($filesystem, 'forgetDisk')) {
+            foreach ($this->filesystemDiskNames() as $name) {
+                $filesystem->forgetDisk($name);
+            }
+        }
+
+        $this->setObjectProperty($filesystem, 'disks', []);
     }
 
     /**
