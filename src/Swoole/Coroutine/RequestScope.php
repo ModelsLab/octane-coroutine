@@ -3,9 +3,11 @@
 namespace Laravel\Octane\Swoole\Coroutine;
 
 use Closure;
+use Illuminate\Contracts\Events\Dispatcher as EventDispatcher;
 use Illuminate\Cache\CacheManager;
 use Illuminate\Foundation\Application;
 use Illuminate\Http\Request;
+use Illuminate\Queue\QueueManager;
 use Illuminate\Redis\RedisManager;
 use Illuminate\Session\SessionManager;
 use ReflectionClass;
@@ -288,6 +290,8 @@ class RequestScope
             'cookie' => $this->createCookieJar(),
             \Inertia\ResponseFactory::class => $this->createInertiaResponseFactory(),
             'log', \Psr\Log\LoggerInterface::class => $this->createLogManager($sandbox),
+            'queue', QueueManager::class, \Illuminate\Contracts\Queue\Factory::class, \Illuminate\Contracts\Queue\Monitor::class => $this->createQueueManager($sandbox),
+            'queue.connection', \Illuminate\Contracts\Queue\Queue::class => $this->createQueueConnection($sandbox),
             'redirect' => $this->createRedirector($sandbox),
             'redis', \Illuminate\Contracts\Redis\Factory::class => $this->createRedisManager($sandbox),
             'request', \Illuminate\Http\Request::class, \Symfony\Component\HttpFoundation\Request::class => $this->get('request'),
@@ -612,6 +616,20 @@ class RequestScope
             'Sentry\\Laravel\\Tracing\\Middleware' => $this->storeScopedAliases([
                 'Sentry\\Laravel\\Tracing\\Middleware',
             ], $resolved),
+            'queue',
+            QueueManager::class,
+            \Illuminate\Contracts\Queue\Factory::class,
+            \Illuminate\Contracts\Queue\Monitor::class => $this->storeScopedAliases([
+                'queue',
+                QueueManager::class,
+                \Illuminate\Contracts\Queue\Factory::class,
+                \Illuminate\Contracts\Queue\Monitor::class,
+            ], $resolved),
+            'queue.connection',
+            \Illuminate\Contracts\Queue\Queue::class => $this->storeScopedAliases([
+                'queue.connection',
+                \Illuminate\Contracts\Queue\Queue::class,
+            ], $resolved),
             default => null,
         };
     }
@@ -715,6 +733,12 @@ class RequestScope
                 return;
             }
 
+            if ($resource instanceof QueueManager) {
+                $this->releaseQueueManager($resource);
+
+                return;
+            }
+
             if ($resource instanceof SessionManager) {
                 $resource->forgetDrivers();
             }
@@ -751,6 +775,23 @@ class RequestScope
         $stores = $config->get('cache.stores', []);
         $default = $config->get('cache.default');
         $names = is_array($stores) ? array_keys($stores) : [];
+
+        if (is_string($default) && $default !== '') {
+            $names[] = $default;
+        }
+
+        return array_values(array_unique(array_filter($names, 'is_string')));
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function queueConnectionNames(): array
+    {
+        $config = $this->app->make('config');
+        $connections = $config->get('queue.connections', []);
+        $default = $config->get('queue.default');
+        $names = is_array($connections) ? array_keys($connections) : [];
 
         if (is_string($default) && $default !== '') {
             $names[] = $default;
@@ -1038,6 +1079,124 @@ class RequestScope
         $cache = $this->resolve('cache', $sandbox);
 
         return $cache?->store();
+    }
+
+    /**
+     * Create an isolated queue manager for the current coroutine.
+     *
+     * QueueManager caches resolved queue connections. RedisQueue then keeps a
+     * Redis factory reference. Sharing either object lets concurrent requests
+     * talk through the same phpredis coroutine socket.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return \Illuminate\Queue\QueueManager
+     */
+    protected function createQueueManager(Application $sandbox): QueueManager
+    {
+        $queue = clone $this->app->make('queue');
+
+        $this->setObjectProperty($queue, 'connections', []);
+        $queue->setApplication($sandbox);
+        $this->registerCoroutineQueueConnectors($queue, $sandbox);
+
+        return $queue;
+    }
+
+    /**
+     * Create the coroutine-local default queue connection.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createQueueConnection(Application $sandbox)
+    {
+        $queue = $this->resolve('queue', $sandbox);
+
+        return $queue?->connection();
+    }
+
+    /**
+     * Rebind framework queue connectors that capture the application instance.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $queue
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return void
+     */
+    protected function registerCoroutineQueueConnectors(QueueManager $queue, Application $sandbox): void
+    {
+        if (class_exists(\Illuminate\Queue\Connectors\NullConnector::class)) {
+            $queue->addConnector('null', static fn () => new \Illuminate\Queue\Connectors\NullConnector);
+        }
+
+        if (class_exists(\Illuminate\Queue\Connectors\SyncConnector::class)) {
+            $queue->addConnector('sync', static fn () => new \Illuminate\Queue\Connectors\SyncConnector);
+        }
+
+        if (class_exists(\Illuminate\Queue\Connectors\DeferredConnector::class)) {
+            $queue->addConnector('deferred', static fn () => new \Illuminate\Queue\Connectors\DeferredConnector);
+        }
+
+        if (class_exists(\Illuminate\Queue\Connectors\BackgroundConnector::class)) {
+            $queue->addConnector('background', static fn () => new \Illuminate\Queue\Connectors\BackgroundConnector);
+        }
+
+        if (class_exists(\Illuminate\Queue\Connectors\FailoverConnector::class)) {
+            $queue->addConnector('failover', fn () => $this->createFailoverQueueConnector($queue, $sandbox));
+        }
+
+        if (class_exists(\Illuminate\Queue\Connectors\DatabaseConnector::class)) {
+            $queue->addConnector('database', static fn () => new \Illuminate\Queue\Connectors\DatabaseConnector($sandbox->make('db')));
+        }
+
+        if (class_exists(\Illuminate\Queue\Connectors\RedisConnector::class)) {
+            $queue->addConnector('redis', fn () => new \Illuminate\Queue\Connectors\RedisConnector($this->resolve('redis', $sandbox)));
+        }
+
+        if (class_exists(\Illuminate\Queue\Connectors\BeanstalkdConnector::class)) {
+            $queue->addConnector('beanstalkd', static fn () => new \Illuminate\Queue\Connectors\BeanstalkdConnector);
+        }
+
+        if (class_exists(\Illuminate\Queue\Connectors\SqsConnector::class)) {
+            $queue->addConnector('sqs', static fn () => new \Illuminate\Queue\Connectors\SqsConnector);
+        }
+    }
+
+    /**
+     * Create a failover connector across Laravel versions.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $queue
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return object
+     */
+    protected function createFailoverQueueConnector(QueueManager $queue, Application $sandbox): object
+    {
+        $class = \Illuminate\Queue\Connectors\FailoverConnector::class;
+        $reflection = new ReflectionClass($class);
+        $constructor = $reflection->getConstructor();
+        $parameters = [$queue];
+
+        if (($constructor?->getNumberOfParameters() ?? 0) >= 2) {
+            $parameters[] = $sandbox->make(EventDispatcher::class);
+        }
+
+        return $reflection->newInstanceArgs($parameters);
+    }
+
+    /**
+     * Release resolved queue connections owned by the request scope.
+     *
+     * @param  \Illuminate\Queue\QueueManager  $queue
+     * @return void
+     */
+    protected function releaseQueueManager(QueueManager $queue): void
+    {
+        if (method_exists($queue, 'purge')) {
+            foreach ($this->queueConnectionNames() as $name) {
+                $queue->purge($name);
+            }
+        }
+
+        $this->setObjectProperty($queue, 'connections', []);
     }
 
     /**
