@@ -49,6 +49,8 @@ class OctaneServiceProvider extends ServiceProvider
             return new \Laravel\Octane\Swoole\Database\DatabaseManager($app, $app['db.factory']);
         });
 
+        $this->bindCoroutineRedisManager();
+
         $this->app->bind(RoadRunnerServerProcessInspector::class, function ($app) {
             return new RoadRunnerServerProcessInspector(
                 $app->make(RoadRunnerServerStateFile::class),
@@ -97,6 +99,53 @@ class OctaneServiceProvider extends ServiceProvider
             return class_exists('Swoole\Http\Server')
                         ? new SwooleCoroutineDispatcher($app->bound('Swoole\Http\Server'))
                         : $app->make(SequentialCoroutineDispatcher::class);
+        });
+    }
+
+    /**
+     * Swap the framework's Redis manager for a coroutine-aware one.
+     *
+     * Swoole binds a hooked phpredis socket to the coroutine that first reads
+     * from it. A second coroutine issuing a command on that same connection
+     * makes Swoole raise "Socket#N has already been bound to another
+     * coroutine#M" from the scheduler, which userland try/catch cannot contain,
+     * so the worker dies outright.
+     *
+     * Boot-time singletons are the exposure: RequestScope isolates whatever
+     * resolves `redis` during a request, but an object built at boot keeps the
+     * worker-level manager forever. The framework's own RateLimiter singleton
+     * is one of those. Making the worker-level manager coroutine-aware fixes
+     * every such holder that re-resolves its connection per operation, which
+     * the cache RedisStore does.
+     *
+     * Registered as an extender because Illuminate's RedisServiceProvider is
+     * deferred: a plain singleton() here would be overwritten the moment the
+     * deferred provider loads.
+     *
+     * @return void
+     */
+    protected function bindCoroutineRedisManager()
+    {
+        $this->app->extend('redis', function ($redis, $app) {
+            if ($redis instanceof \Laravel\Octane\Swoole\Redis\CoroutineRedisManager) {
+                return $redis;
+            }
+
+            // Leave customized managers alone; replacing them would silently
+            // drop whatever behaviour the application layered on. Those apps
+            // still get per-coroutine isolation through RequestScope.
+            if (! $redis instanceof \Illuminate\Redis\RedisManager
+                || $redis::class !== \Illuminate\Redis\RedisManager::class) {
+                return $redis;
+            }
+
+            $config = $app->make('config')->get('database.redis', []);
+
+            return new \Laravel\Octane\Swoole\Redis\CoroutineRedisManager(
+                $app,
+                \Illuminate\Support\Arr::pull($config, 'client', 'phpredis'),
+                $config
+            );
         });
     }
 
