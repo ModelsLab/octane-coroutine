@@ -289,6 +289,7 @@ class RequestScope
             'auth.driver' => $this->createAuthDriver($sandbox),
             'cache', \Illuminate\Contracts\Cache\Factory::class => $this->createCacheManager($sandbox),
             'cache.store', \Illuminate\Contracts\Cache\Repository::class => $this->createCacheStore($sandbox),
+            \Illuminate\Cache\RateLimiter::class => $this->createRateLimiter($sandbox),
             'config' => $this->cloneConfig(),
             'cookie' => $this->createCookieJar(),
             DeferredCallbackCollection::class => new DeferredCallbackCollection,
@@ -1134,6 +1135,51 @@ class RequestScope
         $cache = $this->resolve('cache', $sandbox);
 
         return $cache?->store();
+    }
+
+    /**
+     * Create a coroutine-local rate limiter.
+     *
+     * The framework registers RateLimiter as a singleton that captures a cache
+     * Repository at boot. That Repository holds a RedisStore pointing at the
+     * worker-level Redis manager, so every concurrent request would throttle
+     * through one shared phpredis socket. Swoole binds a hooked socket to the
+     * coroutine that first reads from it and kills the worker when a second
+     * coroutine touches it, and because the scheduler raises that error rather
+     * than throwing it through the calling frame, a fail-open try/catch around
+     * the limiter cannot save the request.
+     *
+     * The base limiter is cloned rather than rebuilt so named limiters that
+     * were registered with RateLimiter::for() during boot survive; only the
+     * cache repository is swapped for the coroutine-local one.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createRateLimiter(Application $sandbox)
+    {
+        $limiterClass = \Illuminate\Cache\RateLimiter::class;
+
+        $cache = $this->resolve('cache', $sandbox);
+
+        if ($cache === null) {
+            return null;
+        }
+
+        $repository = $cache->driver(
+            $sandbox->make('config')->get('cache.limiter')
+        );
+
+        if ($this->app->bound($limiterClass)
+            && ($base = $this->app->make($limiterClass)) instanceof $limiterClass) {
+            $limiter = clone $base;
+
+            $this->setObjectProperty($limiter, 'cache', $repository);
+
+            return $limiter;
+        }
+
+        return new $limiterClass($repository);
     }
 
     /**

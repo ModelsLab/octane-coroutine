@@ -156,6 +156,8 @@ class Worker implements WorkerContract
                 } catch (Throwable $e) {
                     error_log('⚠️ Failed to release coroutine DB connections: '.$e->getMessage());
                 }
+
+                $this->releaseCoroutineRedisConnections();
             }
 
             $sandbox->flush();
@@ -173,6 +175,30 @@ class Worker implements WorkerContract
             // plus reset the current application state back to its original state before
             // it was cloned. Then we will be ready for the next worker iteration loop.
             unset($gateway, $sandbox, $scope, $context, $request, $response, $octaneResponse, $output);
+        }
+    }
+
+    /**
+     * Close the Redis connections the worker-level manager opened for this coroutine.
+     *
+     * The manager keeps them in coroutine context so concurrent requests never
+     * share a hooked phpredis socket. Without this they would only be dropped
+     * when the context is cleared, leaving the sockets open in the meantime.
+     */
+    protected function releaseCoroutineRedisConnections(): void
+    {
+        try {
+            if (! $this->app->resolved('redis')) {
+                return;
+            }
+
+            $redis = $this->app->make('redis');
+
+            if (method_exists($redis, 'releaseConnections')) {
+                $redis->releaseConnections();
+            }
+        } catch (Throwable $e) {
+            error_log('⚠️ Failed to release coroutine Redis connections: '.$e->getMessage());
         }
     }
 
