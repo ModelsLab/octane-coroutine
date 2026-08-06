@@ -162,8 +162,8 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
             // Randomize worker recycling so all busy workers do not restart together.
             'max_request_grace' => $this->maxRequestGrace(),
             
-            // Max size of request/response package (10MB)
-            'package_max_length' => 10 * 1024 * 1024,
+            // Max size of request/response package (20MB)
+            'package_max_length' => 20 * 1024 * 1024,
             
             // Number of reactor threads (set to CPU count for optimal performance)
             'reactor_num' => $this->workerCount($extension),
