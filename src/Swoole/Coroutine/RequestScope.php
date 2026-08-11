@@ -1531,7 +1531,6 @@ class RequestScope
             }
 
             $instanceProperty = $reflection->getProperty($property);
-            $instanceProperty->setAccessible(true);
             $instanceProperty->setValue($object, $value);
         } catch (ReflectionException) {
             // If the implementation changes upstream, fall back gracefully.
@@ -1559,7 +1558,6 @@ class RequestScope
             }
 
             $instanceProperty = $reflection->getProperty($property);
-            $instanceProperty->setAccessible(true);
 
             return $instanceProperty->getValue($object);
         } catch (ReflectionException) {
@@ -1589,7 +1587,6 @@ class RequestScope
             }
 
             $instanceMethod = $reflection->getMethod($method);
-            $instanceMethod->setAccessible(true);
 
             return $instanceMethod->invokeArgs($object, $parameters);
         } catch (ReflectionException) {
