@@ -184,6 +184,31 @@ class CoroutineApplication extends Application
             }
         }
 
+        // Honour contextual bindings while this proxy is mid-build.
+        //
+        // Laravel stores them per-concrete on whichever container the service
+        // provider ran against — always the base app. Delegating to
+        // getCurrentApp() below would resolve on that container with an empty
+        // build stack, so the context is lost and an interface that is only
+        // ever satisfied contextually becomes unresolvable. Interfaces reach
+        // this point because shouldBuildInCoroutineScope() tests class_exists(),
+        // which is false for them.
+        //
+        // Passport wires its controllers exactly this way, and without this
+        // GET /oauth/authorize 500s with "Target
+        // [Illuminate\Contracts\Auth\StatefulGuard] is not instantiable."
+        if (! empty($this->buildStack) && is_string($abstract)) {
+            $contextual = $this->findInContextualBindings($abstract);
+
+            if ($contextual instanceof \Closure) {
+                return $contextual($this);
+            }
+
+            if (is_string($contextual) && $contextual !== $abstract) {
+                return $this->make($contextual, $parameters);
+            }
+        }
+
         return $this->getCurrentApp()->make($abstract, $parameters);
     }
 
@@ -198,6 +223,51 @@ class CoroutineApplication extends Application
     public function buildScopedConcrete($concrete, array $parameters = [])
     {
         return parent::make($concrete, $parameters);
+    }
+
+    /**
+     * Resolve a contextual binding, falling back to the base application.
+     *
+     * Contextual bindings — `$app->when(X)->needs(Y)->give(...)` — are stored in
+     * Container::$contextual on whichever container the service provider ran
+     * against, which is always the base app. When this proxy builds an unbound
+     * concrete itself (see buildScopedConcrete), Laravel looks the contextual
+     * binding up on *this* container, whose $contextual array is empty, so the
+     * dependency falls through to a plain build.
+     *
+     * For an interface that is only ever satisfied contextually that is fatal.
+     * Passport wires its controllers exactly this way:
+     *
+     *     $this->app->when([AuthorizationController::class, ...])
+     *               ->needs(StatefulGuard::class)
+     *               ->give(fn () => Auth::guard(config('passport.guard')));
+     *
+     * Without this fallback, GET /oauth/authorize 500s with
+     * "Target [Illuminate\Contracts\Auth\StatefulGuard] is not instantiable."
+     * Any package using contextual bindings on a controller has the same shape.
+     *
+     * @param  string|callable  $abstract
+     * @return \Closure|string|array|null
+     */
+    protected function findInContextualBindings($abstract)
+    {
+        $binding = parent::findInContextualBindings($abstract);
+
+        if (! is_null($binding)) {
+            return $binding;
+        }
+
+        $concrete = end($this->buildStack);
+
+        if ($concrete === false) {
+            return null;
+        }
+
+        $baseContextual = (function () {
+            return $this->contextual;
+        })->call($this->baseApp);
+
+        return $baseContextual[$concrete][$abstract] ?? null;
     }
 
     /**
