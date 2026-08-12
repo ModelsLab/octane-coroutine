@@ -116,7 +116,19 @@ class DatabasePool
         // dispatcher and the transactions manager. The pool bypasses that, so
         // without this the connection has no dispatcher (DB::listen never
         // fires) and afterCommit() throws.
-        $this->configureForCurrentRequest($connection);
+        try {
+            $this->configureForCurrentRequest($connection);
+        } catch (Throwable $e) {
+            // Handing out an unwired connection would silently reintroduce the
+            // very bug this guards against, so surface it instead. Return the
+            // connection to the pool's accounting first so a failing container
+            // does not also leak the slot.
+            $this->markBorrowed($connection);
+            $this->closeConnection($connection);
+            $this->currentConnections--;
+
+            throw $e;
+        }
 
         return $connection;
     }
@@ -130,11 +142,7 @@ class DatabasePool
             return;
         }
 
-        try {
-            ($this->configurator)($connection);
-        } catch (Throwable $e) {
-            error_log('⚠️ Could not configure pooled DB connection: '.$e->getMessage());
-        }
+        ($this->configurator)($connection);
     }
 
     /**

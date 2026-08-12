@@ -12,6 +12,7 @@ use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Events\TransactionCommitted;
 use Illuminate\Events\Dispatcher;
 use Illuminate\Foundation\Application;
+use Illuminate\Queue\Queue as BaseQueue;
 use Laravel\Octane\Swoole\Coroutine\Context;
 use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
 use Laravel\Octane\Swoole\Coroutine\RequestScope;
@@ -234,6 +235,124 @@ class DatabasePoolConnectionConfigurationTest extends TestCase
         $this->assertTrue($firstRan, 'The callback must still run when its own transaction commits.');
     }
 
+    /**
+     * Queue::enqueueUsing() reads the CONTAINER's 'db.transactions', not the
+     * connection's. The connection and the container must therefore resolve
+     * the same object, or a job dispatched with afterCommit() fires
+     * immediately while the transaction is still open. This is why the
+     * manager is container-scoped rather than private to each connection.
+     */
+    public function test_after_commit_jobs_wait_for_the_pooled_connection_to_commit(): void
+    {
+        $this->skipIfUnsupported();
+
+        $base = $this->baseApplication();
+        $manager = $this->databaseManager($base);
+
+        $pushedDuringTransaction = null;
+        $pushedAfterCommit = null;
+
+        $this->runRequest($base, function () use ($manager, &$pushedDuringTransaction, &$pushedAfterCommit) {
+            $connection = $manager->connection('sqlite');
+
+            $queue = new RecordingQueue;
+            $queue->setContainer(Container::getInstance());
+
+            $connection->beginTransaction();
+            $queue->push(new AfterCommitJob);
+
+            $pushedDuringTransaction = count($queue->pushed);
+
+            $connection->commit();
+
+            $pushedAfterCommit = count($queue->pushed);
+        });
+
+        $this->assertSame(
+            0,
+            $pushedDuringTransaction,
+            'A job dispatched with afterCommit() must not be pushed while the transaction is open.'
+        );
+        $this->assertSame(
+            1,
+            $pushedAfterCommit,
+            'The job must be pushed once the pooled connection commits.'
+        );
+    }
+
+    public function test_after_commit_jobs_are_not_released_by_another_coroutines_commit(): void
+    {
+        $this->skipIfUnsupported();
+
+        $base = $this->baseApplication();
+        $manager = $this->databaseManager($base);
+        $this->installSandbox($base);
+
+        $queue = new RecordingQueue;
+        $queue->setContainer(Container::getInstance());
+
+        $pushedAfterOtherCommit = null;
+        $pushedAfterOwnCommit = null;
+        $failure = null;
+
+        Coroutine\run(function () use (
+            $base, $manager, $queue,
+            &$pushedAfterOtherCommit, &$pushedAfterOwnCommit, &$failure
+        ) {
+            $firstQueued = new Channel(1);
+            $secondCommitted = new Channel(1);
+
+            Coroutine::create(function () use (
+                $base, $manager, $queue, $firstQueued, $secondCommitted,
+                &$pushedAfterOtherCommit, &$pushedAfterOwnCommit, &$failure
+            ) {
+                try {
+                    Context::set('octane.request_scope', new RequestScope($base));
+
+                    $connection = $manager->connection('sqlite');
+                    $connection->beginTransaction();
+                    $queue->push(new AfterCommitJob);
+
+                    $firstQueued->push(true);
+                    $secondCommitted->pop();
+
+                    $pushedAfterOtherCommit = count($queue->pushed);
+
+                    $connection->commit();
+
+                    $pushedAfterOwnCommit = count($queue->pushed);
+                } catch (\Throwable $e) {
+                    $failure = $e;
+                    $firstQueued->push(true);
+                }
+            });
+
+            Coroutine::create(function () use ($base, $manager, $firstQueued, $secondCommitted, &$failure) {
+                try {
+                    $firstQueued->pop();
+
+                    Context::set('octane.request_scope', new RequestScope($base));
+
+                    $connection = $manager->connection('sqlite');
+                    $connection->beginTransaction();
+                    $connection->commit();
+                } catch (\Throwable $e) {
+                    $failure = $e;
+                } finally {
+                    $secondCommitted->push(true);
+                }
+            });
+        });
+
+        $this->assertNull($failure, 'Neither coroutine may fail. Got: '.($failure?->getMessage() ?? ''));
+        $this->assertSame(
+            0,
+            $pushedAfterOtherCommit,
+            "A different coroutine's commit released this coroutine's afterCommit job."
+        );
+        $this->assertSame(1, $pushedAfterOwnCommit, 'The job must be pushed on its own commit.');
+    }
+
     public function test_releasing_a_connection_clears_the_transaction_manager(): void
     {
         $this->skipIfUnsupported();
@@ -373,4 +492,27 @@ class DatabasePoolConnectionConfigurationTest extends TestCase
             $this->markTestSkipped('PDO SQLite is required.');
         }
     }
+}
+
+/**
+ * A queue that records pushes instead of performing them, so a test can see
+ * exactly when enqueueUsing() released a job.
+ */
+class RecordingQueue extends BaseQueue
+{
+    public array $pushed = [];
+
+    public function push($job, $data = '', $queue = null)
+    {
+        return $this->enqueueUsing($job, '', $queue, null, function () use ($job) {
+            $this->pushed[] = $job;
+
+            return 'recorded-job-id';
+        });
+    }
+}
+
+class AfterCommitJob
+{
+    public bool $afterCommit = true;
 }
