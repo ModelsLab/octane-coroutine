@@ -2,6 +2,7 @@
 
 namespace Laravel\Octane\Swoole\Database;
 
+use Closure;
 use Swoole\Coroutine\Channel;
 use Illuminate\Database\Connectors\ConnectionFactory;
 use Illuminate\Database\Connection;
@@ -22,12 +23,28 @@ class DatabasePool
     protected array $idleSince = [];
     protected ?int $idlePruneTimerId = null;
 
-    public function __construct(array $config, array $connectionConfig, string $name, ConnectionFactory $factory)
-    {
+    /**
+     * Wires a borrowed connection to the current request's container services.
+     *
+     * Pooled connections outlive the request that created them, so this runs
+     * on every checkout rather than once at creation.
+     *
+     * @var \Closure(\Illuminate\Database\Connection): void|null
+     */
+    protected ?Closure $configurator;
+
+    public function __construct(
+        array $config,
+        array $connectionConfig,
+        string $name,
+        ConnectionFactory $factory,
+        ?Closure $configurator = null
+    ) {
         $this->config = $config;
         $this->name = $name;
         $this->factory = $factory;
         $this->connectionConfig = $connectionConfig;
+        $this->configurator = $configurator;
 
         // Create a channel for pooling connections
         // Channel size = max_connections
@@ -95,7 +112,29 @@ class DatabasePool
             $connection = $this->createConnection();
         }
 
+        // Illuminate's DatabaseManager::configure() normally attaches the event
+        // dispatcher and the transactions manager. The pool bypasses that, so
+        // without this the connection has no dispatcher (DB::listen never
+        // fires) and afterCommit() throws.
+        $this->configureForCurrentRequest($connection);
+
         return $connection;
+    }
+
+    /**
+     * Wire a borrowed connection to the current request's container services.
+     */
+    protected function configureForCurrentRequest($connection): void
+    {
+        if ($this->configurator === null || ! $connection instanceof Connection) {
+            return;
+        }
+
+        try {
+            ($this->configurator)($connection);
+        } catch (Throwable $e) {
+            error_log('⚠️ Could not configure pooled DB connection: '.$e->getMessage());
+        }
     }
 
     /**
@@ -236,6 +275,12 @@ class DatabasePool
                         error_log('⚠️ Could not reset PostgreSQL session: '.$e->getMessage());
                     }
                 }
+
+                // Drop the finishing request's transactions manager. It is
+                // scoped to that coroutine, and holding it here would let its
+                // pending afterCommit callbacks fire for the next borrower.
+                // The next checkout attaches the manager it belongs to.
+                $connection->unsetTransactionManager();
             }
         } catch (Throwable $e) {
             error_log('❌ Error resetting connection state: '.$e->getMessage());
@@ -266,7 +311,22 @@ class DatabasePool
         $this->currentConnections++;
 
         try {
-            return $this->factory->make($this->connectionConfig, $this->name);
+            $connection = $this->factory->make($this->connectionConfig, $this->name);
+
+            if ($connection instanceof Connection) {
+                // Without a reconnector, Connection::reconnect() throws
+                // LostConnectionException and the pool silently discards and
+                // rebuilds the connection on every stale checkout. Swapping the
+                // PDO in place keeps the object identity the pool holds.
+                $connection->setReconnector(function (Connection $connection): void {
+                    $fresh = $this->factory->make($this->connectionConfig, $this->name);
+
+                    $connection->setPdo($fresh->getRawPdo())
+                        ->setReadPdo($fresh->getRawReadPdo());
+                });
+            }
+
+            return $connection;
         } catch (Throwable $e) {
             $this->currentConnections--;
 

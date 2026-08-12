@@ -2,6 +2,7 @@
 
 namespace Laravel\Octane\Swoole\Database;
 
+use Illuminate\Database\Connection;
 use Illuminate\Database\DatabaseManager as BaseDatabaseManager;
 use Laravel\Octane\CurrentApplication;
 use Laravel\Octane\Swoole\Coroutine\Context;
@@ -60,13 +61,46 @@ class DatabaseManager extends BaseDatabaseManager
             ];
 
             $this->pools[$name] = new DatabasePool(
-                $poolConfig, 
-                $config, 
-                $name, 
-                $this->factory
+                $poolConfig,
+                $config,
+                $name,
+                $this->factory,
+                fn (Connection $connection) => $this->configurePooledConnection($connection)
             );
         }
         return $this->pools[$name];
+    }
+
+    /**
+     * Attach the current request's container services to a pooled connection.
+     *
+     * Illuminate\Database\DatabaseManager::configure() does this for ordinary
+     * connections. Pooled connections are built straight from the factory, so
+     * they arrive with no event dispatcher and no transactions manager. That
+     * makes DB::listen() silent and afterCommit() throw.
+     *
+     * This runs on every checkout, not once at creation: a pooled connection
+     * outlives the coroutine that first borrowed it, and 'db.transactions' is
+     * scoped per coroutine by RequestScope.
+     */
+    protected function configurePooledConnection(Connection $connection): void
+    {
+        $app = CurrentApplication::get() ?: $this->app;
+
+        if (! $app) {
+            return;
+        }
+
+        if ($app->bound('events')) {
+            $connection->setEventDispatcher($app['events']);
+        }
+
+        // Resolve through the same container the queue and event dispatchers
+        // use, so a job dispatched with afterCommit() and the connection agree
+        // on whether a transaction is open.
+        if ($app->bound('db.transactions')) {
+            $connection->setTransactionManager($app['db.transactions']);
+        }
     }
 
     protected function shouldPoolConnection(string $name): bool

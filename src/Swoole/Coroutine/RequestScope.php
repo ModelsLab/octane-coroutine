@@ -5,6 +5,7 @@ namespace Laravel\Octane\Swoole\Coroutine;
 use Closure;
 use Illuminate\Contracts\Events\Dispatcher as EventDispatcher;
 use Illuminate\Cache\CacheManager;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Filesystem\FilesystemManager;
 use Illuminate\Foundation\Application;
 use Illuminate\Http\Request;
@@ -292,6 +293,7 @@ class RequestScope
             \Illuminate\Cache\RateLimiter::class => $this->createRateLimiter($sandbox),
             'config' => $this->cloneConfig(),
             'cookie' => $this->createCookieJar(),
+            'db.transactions' => new DatabaseTransactionsManager,
             DeferredCallbackCollection::class => new DeferredCallbackCollection,
             'filesystem', FilesystemManager::class, \Illuminate\Contracts\Filesystem\Factory::class => $this->createFilesystemManager($sandbox),
             'filesystem.disk', \Illuminate\Contracts\Filesystem\Filesystem::class => $this->createFilesystemDisk($sandbox),
