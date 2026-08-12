@@ -3,6 +3,7 @@
 namespace Laravel\Octane\Swoole\Coroutine;
 
 use Closure;
+use Illuminate\Auth\AuthManager;
 use Illuminate\Contracts\Events\Dispatcher as EventDispatcher;
 use Illuminate\Cache\CacheManager;
 use Illuminate\Filesystem\FilesystemManager;
@@ -929,6 +930,22 @@ class RequestScope
 
             $reflection = new \ReflectionFunction($creator);
             if ($reflection->isStatic()) {
+                continue;
+            }
+
+            // Only rebind creators the AuthManager itself closed over.
+            // Auth::viaRequest() builds its closure inside AuthManager, so $this
+            // is the manager and rebinding is exactly what makes the
+            // coroutine-local request visible to the guard.
+            //
+            // A creator registered by a service provider is a different animal:
+            // Sanctum's guard extension calls $this->createGuard(), where $this
+            // is the SanctumServiceProvider. Rebinding it to the AuthManager
+            // routes that call through AuthManager::__call, which forwards to
+            // the default guard and throws "Method
+            // Lab404\Impersonate\Guard\SessionGuard::createGuard does not
+            // exist" on every sanctum-authenticated request.
+            if (! $reflection->getClosureThis() instanceof AuthManager) {
                 continue;
             }
 
