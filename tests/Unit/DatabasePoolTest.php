@@ -137,6 +137,7 @@ class DatabasePoolTest extends TestCase
         $connection->shouldReceive('flushQueryLog')->once();
         $connection->shouldReceive('forgetRecordModificationState')->once();
         $connection->shouldReceive('setReadWriteType')->with(null)->once();
+        $connection->shouldReceive('unsetTransactionManager')->once();
         $connection->shouldReceive('getDriverName')->andReturn('mysql');
 
         $this->invokeResetConnection($pool, $connection);
@@ -158,6 +159,7 @@ class DatabasePoolTest extends TestCase
         $connection->shouldReceive('flushQueryLog')->once();
         $connection->shouldReceive('forgetRecordModificationState')->once();
         $connection->shouldReceive('setReadWriteType')->with(null)->once();
+        $connection->shouldReceive('unsetTransactionManager')->once();
         $connection->shouldReceive('getDriverName')->andReturn('pgsql');
 
         $this->invokeResetConnection($pool, $connection);
@@ -369,6 +371,12 @@ class DatabasePoolTest extends TestCase
         $connections[0]->shouldReceive('disconnect')->once();
         $connections[1]->shouldReceive('disconnect')->once();
         $connections[2]->shouldNotReceive('disconnect');
+
+        // The pool now installs a reconnector on each new connection, the way
+        // Illuminate\Database\DatabaseManager::configure() does.
+        foreach ($connections as $connection) {
+            $connection->shouldReceive('setReconnector')->once();
+        }
 
         $factory = Mockery::mock(ConnectionFactory::class);
         $factory->shouldReceive('make')
