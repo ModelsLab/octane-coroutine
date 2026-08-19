@@ -442,6 +442,13 @@ class DatabasePoolTest extends TestCase
 
             $first = $pool->get();
             \Swoole\Coroutine::sleep(0.08);
+
+            // Probe: the expired fast-path must close the connection without
+            // running the full session reset first (resetConnection flushes
+            // the query log, so a surviving entry proves it was skipped).
+            $first->enableQueryLog();
+            $first->logQuery('probe', [], 0);
+
             $pool->release($first);
 
             $statsAfterRelease = $pool->getStats();
@@ -452,6 +459,7 @@ class DatabasePoolTest extends TestCase
         $this->assertSame(0, $statsAfterRelease['current_connections'], 'Expired connection must be closed, not re-pooled.');
         $this->assertSame(0, $statsAfterRelease['available_connections']);
         $this->assertNotSame($first, $second, 'A fresh connection must replace the expired one.');
+        $this->assertCount(1, $first->getQueryLog(), 'Expired connections must be closed directly, without a pointless session reset.');
     }
 
     public function test_release_repools_connection_within_max_lifetime(): void
