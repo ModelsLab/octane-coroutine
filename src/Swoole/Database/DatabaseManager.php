@@ -58,6 +58,7 @@ class DatabaseManager extends BaseDatabaseManager
                 'wait_timeout' => 3.0,
                 'heartbeat' => -1,
                 'max_idle_time' => 60.0,
+                'max_lifetime' => 300.0,
             ];
 
             $this->pools[$name] = new DatabasePool(

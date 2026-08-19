@@ -135,46 +135,50 @@ class Worker implements WorkerContract
         } catch (Throwable $e) {
             $this->handleWorkerError($e, $sandbox, $request, $context, $responded);
         } finally {
-            if ($inCoroutine) {
-                if ($sandbox->bound(LivewireCoroutineMutex::class)) {
-                    $sandbox->make(LivewireCoroutineMutex::class)->releaseAllForCurrentCoroutine();
-                }
+            // Detach this coroutine's pooled connections but do NOT return
+            // them to the pool yet. Statements the request still references
+            // must be destroyed while these connections are idle: mysqlnd
+            // silently skips COM_STMT_CLOSE when a connection is busy in
+            // another coroutine, permanently leaking the statement server-side.
+            $pooledConnections = [];
 
-                // Release coroutine-local database connections before flushing
-                // request scope. Flushing first can drop the context references
-                // needed by the pool, leaving its counters exhausted while PDOs
-                // are already gone.
-                try {
-                    if ($sandbox->bound('db')) {
-                        $db = $sandbox->make('db');
-                        if (method_exists($db, 'releaseConnections')) {
-                            $db->releaseConnections();
-                        }
+            try {
+                if ($inCoroutine) {
+                    if ($sandbox->bound(LivewireCoroutineMutex::class)) {
+                        $sandbox->make(LivewireCoroutineMutex::class)->releaseAllForCurrentCoroutine();
                     }
 
-                    $this->releaseDatabaseConnectionsFromContext();
-                } catch (Throwable $e) {
-                    error_log('⚠️ Failed to release coroutine DB connections: '.$e->getMessage());
+                    try {
+                        $pooledConnections = $this->detachDatabaseConnectionsFromContext();
+                    } catch (Throwable $e) {
+                        error_log('⚠️ Failed to detach coroutine DB connections: '.$e->getMessage());
+                    }
+
+                    $this->releaseCoroutineRedisConnections();
                 }
 
-                $this->releaseCoroutineRedisConnections();
+                $sandbox->flush();
+
+                $this->app->make('view.engine.resolver')->forget('blade');
+                $this->app->make('view.engine.resolver')->forget('php');
+
+                if ($inCoroutine) {
+                    Context::clear();
+                } else {
+                    CurrentApplication::set($this->app);
+                }
+
+                // After the request handling process has completed we will unset some variables
+                // plus reset the current application state back to its original state before
+                // it was cloned. Then we will be ready for the next worker iteration loop.
+                unset($gateway, $sandbox, $scope, $context, $request, $response, $octaneResponse, $output);
+
+                if ($inCoroutine && $pooledConnections !== []) {
+                    gc_collect_cycles();
+                }
+            } finally {
+                $this->releaseDetachedDatabaseConnections($pooledConnections);
             }
-
-            $sandbox->flush();
-
-            $this->app->make('view.engine.resolver')->forget('blade');
-            $this->app->make('view.engine.resolver')->forget('php');
-
-            if ($inCoroutine) {
-                Context::clear();
-            } else {
-                CurrentApplication::set($this->app);
-            }
-
-            // After the request handling process has completed we will unset some variables
-            // plus reset the current application state back to its original state before
-            // it was cloned. Then we will be ready for the next worker iteration loop.
-            unset($gateway, $sandbox, $scope, $context, $request, $response, $octaneResponse, $output);
         }
     }
 
@@ -203,10 +207,21 @@ class Worker implements WorkerContract
     }
 
     /**
-     * Release DB pools directly from coroutine context as a final guard.
+     * Remove this coroutine's pooled DB connections from context without
+     * releasing them yet.
+     *
+     * The caller must destroy the request's remaining object graph (and run
+     * cycle collection) BEFORE handing these back via
+     * releaseDetachedDatabaseConnections(). Once a connection re-enters the
+     * pool another coroutine can be mid-query on it, and any PDOStatement
+     * destroyed at that moment leaks its server-side prepared statement.
+     *
+     * @return array<int, array{0: \Laravel\Octane\Swoole\Database\DatabasePool, 1: mixed}>
      */
-    protected function releaseDatabaseConnectionsFromContext(): void
+    protected function detachDatabaseConnectionsFromContext(): array
     {
+        $detached = [];
+
         foreach (Context::all() as $key => $value) {
             if (! is_string($key) || ! str_ends_with($key, '.pool')) {
                 continue;
@@ -216,11 +231,29 @@ class Worker implements WorkerContract
             $connection = Context::get($connectionKey);
 
             if ($connection && $value instanceof \Laravel\Octane\Swoole\Database\DatabasePool) {
-                $value->release($connection);
+                $detached[] = [$value, $connection];
             }
 
             Context::delete($key);
             Context::delete($connectionKey);
+        }
+
+        return $detached;
+    }
+
+    /**
+     * Return detached pooled connections to their pools.
+     *
+     * @param  array<int, array{0: \Laravel\Octane\Swoole\Database\DatabasePool, 1: mixed}>  $pooledConnections
+     */
+    protected function releaseDetachedDatabaseConnections(array $pooledConnections): void
+    {
+        foreach ($pooledConnections as [$pool, $connection]) {
+            try {
+                $pool->release($connection);
+            } catch (Throwable $e) {
+                error_log('⚠️ Failed to release coroutine DB connection: '.$e->getMessage());
+            }
         }
     }
 

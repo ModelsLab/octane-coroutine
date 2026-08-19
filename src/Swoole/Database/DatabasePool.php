@@ -21,6 +21,7 @@ class DatabasePool
     protected ConnectionFactory $factory;
     protected array $connectionConfig;
     protected array $idleSince = [];
+    protected array $createdAt = [];
     protected ?int $idlePruneTimerId = null;
 
     /**
@@ -154,6 +155,21 @@ class DatabasePool
             return;
         }
 
+        // Recycle connections past max_lifetime instead of re-pooling them.
+        // PDO statements destroyed while a connection is busy in another
+        // coroutine leak server-side (mysqlnd skips COM_STMT_CLOSE on a busy
+        // connection and never retries), so any long-lived pooled connection
+        // accumulates leaked prepared statements. Closing it here frees them
+        // all; disconnecting also discards any dirty server-side state.
+        if ($this->hasOutlivedMaxLifetime($connection)) {
+            $this->markBorrowed($connection);
+            $this->closeConnection($connection);
+            $this->currentConnections--;
+            $this->pruneIdleConnections();
+
+            return;
+        }
+
         try {
             $this->resetConnection($connection);
             $this->markIdle($connection);
@@ -184,13 +200,19 @@ class DatabasePool
     public function pruneIdleConnections(?float $now = null): int
     {
         $maxIdleTime = (float) ($this->config['max_idle_time'] ?? 60.0);
+        $minConnections = (int) ($this->config['min_connections'] ?? 1);
 
-        if ($maxIdleTime <= 0 || $this->currentConnections <= ($this->config['min_connections'] ?? 1)) {
+        // Idle pruning respects min_connections; lifetime pruning does not,
+        // since an over-age connection carries leaked server-side prepared
+        // statements that only closing it can free. The pool refills on demand.
+        $idlePruningActive = $maxIdleTime > 0 && $this->currentConnections > $minConnections;
+        $lifetimePruningActive = ((float) ($this->config['max_lifetime'] ?? 300.0)) > 0;
+
+        if (! $idlePruningActive && ! $lifetimePruningActive) {
             return 0;
         }
 
         $now ??= microtime(true);
-        $minConnections = (int) ($this->config['min_connections'] ?? 1);
         $available = $this->channel->length();
         $kept = [];
         $closed = 0;
@@ -206,7 +228,11 @@ class DatabasePool
             $idleSince = $this->idleSince[$connectionId] ?? $now;
             $idleFor = $now - $idleSince;
 
-            if ($this->currentConnections > $minConnections && $idleFor >= $maxIdleTime) {
+            $idleExpired = $maxIdleTime > 0
+                && $this->currentConnections > $minConnections
+                && $idleFor >= $maxIdleTime;
+
+            if ($idleExpired || $this->hasOutlivedMaxLifetime($connection, $now)) {
                 unset($this->idleSince[$connectionId]);
                 $this->closeConnection($connection);
                 $this->currentConnections--;
@@ -302,6 +328,10 @@ class DatabasePool
      */
     protected function closeConnection($connection): void
     {
+        if (is_object($connection)) {
+            unset($this->createdAt[spl_object_id($connection)]);
+        }
+
         try {
             if ($connection instanceof Connection) {
                 $connection->disconnect();
@@ -309,6 +339,26 @@ class DatabasePool
         } catch (Throwable $e) {
             error_log('⚠️ Error closing connection: '.$e->getMessage());
         }
+    }
+
+    /**
+     * Whether a connection is older than the pool's max_lifetime.
+     *
+     * A value of 0 or less disables lifetime recycling. Connections without a
+     * recorded creation time are treated as brand new.
+     */
+    protected function hasOutlivedMaxLifetime($connection, ?float $now = null): bool
+    {
+        $maxLifetime = (float) ($this->config['max_lifetime'] ?? 300.0);
+
+        if ($maxLifetime <= 0 || ! is_object($connection)) {
+            return false;
+        }
+
+        $now ??= microtime(true);
+        $createdAt = $this->createdAt[spl_object_id($connection)] ?? $now;
+
+        return ($now - $createdAt) >= $maxLifetime;
     }
 
     /**
@@ -320,6 +370,10 @@ class DatabasePool
 
         try {
             $connection = $this->factory->make($this->connectionConfig, $this->name);
+
+            if (is_object($connection)) {
+                $this->createdAt[spl_object_id($connection)] = microtime(true);
+            }
 
             if ($connection instanceof Connection) {
                 // Without a reconnector, Connection::reconnect() throws
@@ -419,6 +473,7 @@ class DatabasePool
             'max_connections' => $this->config['max_connections'] ?? 10,
             'min_connections' => $this->config['min_connections'] ?? 1,
             'max_idle_time' => $this->config['max_idle_time'] ?? 60.0,
+            'max_lifetime' => $this->config['max_lifetime'] ?? 300.0,
         ];
     }
 
