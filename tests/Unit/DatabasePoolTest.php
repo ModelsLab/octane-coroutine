@@ -501,6 +501,42 @@ class DatabasePoolTest extends TestCase
         $this->assertSame($first, $second, 'A young connection must be re-pooled and reused.');
     }
 
+    public function test_expired_connection_rolls_back_open_transaction_before_close(): void
+    {
+        $this->skipIfNoSwooleCoroutine();
+
+        if (! extension_loaded('pdo_sqlite')) {
+            $this->markTestSkipped('PDO SQLite is required.');
+        }
+
+        $pdo = new PDO('sqlite::memory:');
+
+        $factory = Mockery::mock(ConnectionFactory::class);
+        $factory->shouldReceive('make')
+            ->once()
+            ->withAnyArgs()
+            ->andReturn(new Connection($pdo, 'database', '', []));
+
+        \Swoole\Coroutine\run(function () use ($factory) {
+            $pool = new DatabasePool([
+                'min_connections' => 0,
+                'max_connections' => 1,
+                'wait_timeout' => 0.1,
+                'max_lifetime' => 0.01,
+            ], [], 'sqlite', $factory);
+
+            $connection = $pool->get();
+            $connection->beginTransaction();
+            \Swoole\Coroutine::sleep(0.03);
+            $pool->release($connection);
+        });
+
+        // Connection::disconnect() only drops the PDO reference; if another
+        // reference keeps the PDO alive (we do here, as a leaked statement
+        // would), an un-rolled-back transaction would keep holding its locks.
+        $this->assertFalse($pdo->inTransaction(), 'The expired fast-path must roll back abandoned transactions before closing.');
+    }
+
     public function test_zero_max_lifetime_disables_recycling(): void
     {
         $this->skipIfNoSwooleCoroutine();

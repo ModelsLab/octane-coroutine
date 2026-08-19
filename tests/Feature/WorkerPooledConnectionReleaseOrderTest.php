@@ -60,6 +60,66 @@ class WorkerPooledConnectionReleaseOrderTest extends TestCase
             'Request garbage must be destroyed (destruct) before the pooled connection is released (release).'
         );
     }
+    /**
+     * A destructor that runs during teardown gc can borrow a fresh pooled
+     * connection into the already-detached context. The worker must sweep
+     * and release it, or the pool slot is orphaned and the pool eventually
+     * reports exhaustion.
+     *
+     * @requires extension swoole
+     */
+    public function test_connections_borrowed_by_destructors_during_teardown_are_released(): void
+    {
+        if (! class_exists(Coroutine::class) || ! function_exists('Swoole\\Coroutine\\run')) {
+            $this->markTestSkipped('Swoole coroutine support is required.');
+        }
+
+        $events = new ArrayObject();
+        $latePool = new ReleaseOrderRecordingPool($events);
+
+        $this->app['router']->get('/pool-late-borrow', function () use ($events, $latePool) {
+            Context::set('db.connection.main', new stdClass());
+            Context::set('db.connection.main.pool', new ReleaseOrderRecordingPool(new ArrayObject()));
+
+            $probe = new LateBorrowProbe($latePool);
+            $probe->self = $probe;
+            unset($probe);
+
+            return response()->json(['ok' => true]);
+        });
+
+        $client = new FakeClient([]);
+        $worker = $this->createWorker($client);
+        $worker->boot();
+
+        \Swoole\Coroutine\run(function () use ($worker) {
+            Coroutine::create(function () use ($worker) {
+                $request = Request::create('/pool-late-borrow', 'GET');
+                $worker->handle($request, new RequestContext(['request' => $request]));
+            });
+        });
+
+        $this->assertContains(
+            'release',
+            iterator_to_array($events),
+            'A connection borrowed into context by a destructor during teardown must still be released.'
+        );
+    }
+}
+
+class LateBorrowProbe
+{
+    public ?self $self = null;
+
+    public function __construct(protected DatabasePool $pool)
+    {
+    }
+
+    public function __destruct()
+    {
+        Context::set('db.connection.late', new stdClass());
+        Context::set('db.connection.late.pool', $this->pool);
+    }
 }
 
 class ReleaseOrderRecordingPool extends DatabasePool

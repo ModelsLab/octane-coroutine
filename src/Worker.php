@@ -135,23 +135,29 @@ class Worker implements WorkerContract
         } catch (Throwable $e) {
             $this->handleWorkerError($e, $sandbox, $request, $context, $responded);
         } finally {
-            // Detach this coroutine's pooled connections but do NOT return
-            // them to the pool yet. Statements the request still references
-            // must be destroyed while these connections are idle: mysqlnd
-            // silently skips COM_STMT_CLOSE when a connection is busy in
-            // another coroutine, permanently leaking the statement server-side.
+            // Detach this coroutine's pooled connections FIRST — before any
+            // call that could throw — but do NOT return them to the pool yet.
+            // Statements the request still references must be destroyed while
+            // these connections are idle: mysqlnd silently skips
+            // COM_STMT_CLOSE when a connection is busy in another coroutine,
+            // permanently leaking the statement server-side. (On the error
+            // paths below the connections are still released, just without
+            // the garbage-first ordering — a bounded, logged degradation.)
             $pooledConnections = [];
+            $dbManager = null;
 
             try {
                 if ($inCoroutine) {
-                    if ($sandbox->bound(LivewireCoroutineMutex::class)) {
-                        $sandbox->make(LivewireCoroutineMutex::class)->releaseAllForCurrentCoroutine();
-                    }
-
                     try {
                         $pooledConnections = $this->detachDatabaseConnectionsFromContext();
-                    } catch (Throwable $e) {
-                        error_log('⚠️ Failed to detach coroutine DB connections: '.$e->getMessage());
+                    } catch (Throwable $detachException) {
+                        error_log('⚠️ Failed to detach coroutine DB connections: '.$detachException->getMessage());
+                    }
+
+                    $dbManager = $sandbox->bound('db') ? $sandbox->make('db') : null;
+
+                    if ($sandbox->bound(LivewireCoroutineMutex::class)) {
+                        $sandbox->make(LivewireCoroutineMutex::class)->releaseAllForCurrentCoroutine();
                     }
 
                     $this->releaseCoroutineRedisConnections();
@@ -163,6 +169,15 @@ class Worker implements WorkerContract
                 $this->app->make('view.engine.resolver')->forget('php');
 
                 if ($inCoroutine) {
+                    // Destructors triggered by flush() may have borrowed fresh
+                    // pooled connections into context. Fold them into the
+                    // deferred set before the context is cleared, or their
+                    // pool slots would leak.
+                    $pooledConnections = array_merge(
+                        $pooledConnections,
+                        $this->detachDatabaseConnectionsFromContext()
+                    );
+
                     Context::clear();
                 } else {
                     CurrentApplication::set($this->app);
@@ -171,13 +186,40 @@ class Worker implements WorkerContract
                 // After the request handling process has completed we will unset some variables
                 // plus reset the current application state back to its original state before
                 // it was cloned. Then we will be ready for the next worker iteration loop.
-                unset($gateway, $sandbox, $scope, $context, $request, $response, $octaneResponse, $output);
+                // $e is included: its trace args reference the request's object
+                // graph (potentially PDO statements), which must die before the
+                // connections below are released.
+                unset($gateway, $sandbox, $scope, $context, $request, $response, $octaneResponse, $output, $e);
 
-                if ($inCoroutine && $pooledConnections !== []) {
+                if ($inCoroutine && $pooledConnections !== [] && gc_status()['roots'] > 0) {
                     gc_collect_cycles();
                 }
             } finally {
                 $this->releaseDetachedDatabaseConnections($pooledConnections);
+
+                if ($inCoroutine) {
+                    // A destructor run during teardown or gc above may have
+                    // borrowed another pooled connection into context after
+                    // the detach passes. Sweep again so it cannot orphan a
+                    // pool slot.
+                    try {
+                        $this->releaseDetachedDatabaseConnections($this->detachDatabaseConnectionsFromContext());
+                    } catch (Throwable $sweepException) {
+                        error_log('⚠️ Failed to sweep late coroutine DB connections: '.$sweepException->getMessage());
+                    }
+
+                    // Keep pruning ALL pools once per request, as the removed
+                    // DatabaseManager::releaseConnections() call used to, so
+                    // pools for connections this request never touched still
+                    // shed idle and over-age entries.
+                    if ($dbManager && method_exists($dbManager, 'pruneIdleConnections')) {
+                        try {
+                            $dbManager->pruneIdleConnections();
+                        } catch (Throwable $pruneException) {
+                            error_log('⚠️ Failed to prune idle DB connections: '.$pruneException->getMessage());
+                        }
+                    }
+                }
             }
         }
     }
@@ -227,7 +269,7 @@ class Worker implements WorkerContract
                 continue;
             }
 
-            $connectionKey = str_replace('.pool', '', $key);
+            $connectionKey = substr($key, 0, -strlen('.pool'));
             $connection = Context::get($connectionKey);
 
             if ($connection && $value instanceof \Laravel\Octane\Swoole\Database\DatabasePool) {

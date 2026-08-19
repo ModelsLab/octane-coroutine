@@ -14,6 +14,13 @@ use Throwable;
  */
 class DatabasePool
 {
+    /**
+     * Default number of seconds a pooled connection lives before it is
+     * recycled. Recycling frees any server-side prepared statements the
+     * connection has leaked (see release()).
+     */
+    public const DEFAULT_MAX_LIFETIME = 300.0;
+
     protected Channel $channel;
     protected int $currentConnections = 0;
     protected array $config;
@@ -159,10 +166,13 @@ class DatabasePool
         // PDO statements destroyed while a connection is busy in another
         // coroutine leak server-side (mysqlnd skips COM_STMT_CLOSE on a busy
         // connection and never retries), so any long-lived pooled connection
-        // accumulates leaked prepared statements. Closing it here frees them
-        // all; disconnecting also discards any dirty server-side state.
+        // accumulates leaked prepared statements. Closing it frees them all.
+        // Transactions are rolled back explicitly first: disconnect() only
+        // drops the Connection's PDO reference, and a leaked statement can
+        // keep the PDO (and its row locks) alive until a future gc run.
         if ($this->hasOutlivedMaxLifetime($connection)) {
             $this->markBorrowed($connection);
+            $this->rollBackAbandonedTransactions($connection);
             $this->closeConnection($connection);
             $this->currentConnections--;
             $this->pruneIdleConnections();
@@ -206,7 +216,7 @@ class DatabasePool
         // since an over-age connection carries leaked server-side prepared
         // statements that only closing it can free. The pool refills on demand.
         $idlePruningActive = $maxIdleTime > 0 && $this->currentConnections > $minConnections;
-        $lifetimePruningActive = ((float) ($this->config['max_lifetime'] ?? 300.0)) > 0;
+        $lifetimePruningActive = ((float) ($this->config['max_lifetime'] ?? self::DEFAULT_MAX_LIFETIME)) > 0;
 
         if (! $idlePruningActive && ! $lifetimePruningActive) {
             return 0;
@@ -245,7 +255,13 @@ class DatabasePool
         }
 
         foreach ($kept as $connection) {
-            $this->channel->push($connection, 0.001);
+            if (! $this->channel->push($connection, 0.001)) {
+                error_log('⚠️ Could not re-pool a kept connection - closing it instead');
+                $this->markBorrowed($connection);
+                $this->closeConnection($connection);
+                $this->currentConnections--;
+                $closed++;
+            }
         }
 
         return $closed;
@@ -342,6 +358,34 @@ class DatabasePool
     }
 
     /**
+     * Roll back any transaction left open on a connection about to be closed.
+     *
+     * @see release() for why closing alone is not enough.
+     */
+    protected function rollBackAbandonedTransactions($connection): void
+    {
+        if (! $connection instanceof Connection) {
+            return;
+        }
+
+        try {
+            if ($connection->transactionLevel() > 0) {
+                $connection->rollBack(0);
+            }
+
+            $pdo = $connection->getPdo();
+
+            if ($pdo && $pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            $connection->unsetTransactionManager();
+        } catch (Throwable $e) {
+            error_log('⚠️ Could not roll back before recycling expired connection: '.$e->getMessage());
+        }
+    }
+
+    /**
      * Whether a connection is older than the pool's max_lifetime.
      *
      * A value of 0 or less disables lifetime recycling. Connections without a
@@ -349,7 +393,7 @@ class DatabasePool
      */
     protected function hasOutlivedMaxLifetime($connection, ?float $now = null): bool
     {
-        $maxLifetime = (float) ($this->config['max_lifetime'] ?? 300.0);
+        $maxLifetime = (float) ($this->config['max_lifetime'] ?? self::DEFAULT_MAX_LIFETIME);
 
         if ($maxLifetime <= 0 || ! is_object($connection)) {
             return false;
@@ -385,6 +429,10 @@ class DatabasePool
 
                     $connection->setPdo($fresh->getRawPdo())
                         ->setReadPdo($fresh->getRawReadPdo());
+
+                    // The server session is brand new, so restart the
+                    // max_lifetime clock along with it.
+                    $this->createdAt[spl_object_id($connection)] = microtime(true);
                 });
             }
 
@@ -473,7 +521,7 @@ class DatabasePool
             'max_connections' => $this->config['max_connections'] ?? 10,
             'min_connections' => $this->config['min_connections'] ?? 1,
             'max_idle_time' => $this->config['max_idle_time'] ?? 60.0,
-            'max_lifetime' => $this->config['max_lifetime'] ?? 300.0,
+            'max_lifetime' => $this->config['max_lifetime'] ?? self::DEFAULT_MAX_LIFETIME,
         ];
     }
 
