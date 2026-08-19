@@ -145,6 +145,12 @@ DB_PERSISTENT=false
 DB_POOL_HEARTBEAT=10
 DB_POOL_MAX_IDLE_TIME=60
 
+# Pooled connections are recycled after this many seconds (default 300,
+# 0 disables). PDO statements destroyed while a pooled connection is busy in
+# another coroutine leak server-side (mysqlnd skips COM_STMT_CLOSE and never
+# retries), so recycling bounds what any one connection can accumulate.
+# Set via the 'max_lifetime' key of the connection's 'pool' config array.
+
 # Redis persistent sockets are unsafe for request-scoped coroutine managers.
 REDIS_PERSISTENT=false
 REDIS_SESSION_PERSISTENT=false
