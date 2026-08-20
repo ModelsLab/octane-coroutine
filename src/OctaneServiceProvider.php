@@ -49,6 +49,18 @@ class OctaneServiceProvider extends ServiceProvider
             return new \Laravel\Octane\Swoole\Database\DatabaseManager($app, $app['db.factory']);
         });
 
+        // MySQL 9.0.x re-prepares statements on every execute that carries an
+        // integer-typed parameter; mysqlnd silently retries, costing two extra
+        // round trips per int-bound query (measured at 54% of all executes in
+        // production). Bind integers as strings instead - the server casts the
+        // constant once, plans and results are identical. Escape hatch:
+        // OCTANE_MYSQL_STRING_BINDINGS=false.
+        if (config('octane.mysql_string_bindings', true) !== false) {
+            \Illuminate\Database\Connection::resolverFor('mysql', function ($connection, $database, $prefix, $config) {
+                return new \Laravel\Octane\Swoole\Database\MySqlStringBindingConnection($connection, $database, $prefix, $config);
+            });
+        }
+
         $this->bindCoroutineRedisManager();
 
         $this->app->bind(RoadRunnerServerProcessInspector::class, function ($app) {
