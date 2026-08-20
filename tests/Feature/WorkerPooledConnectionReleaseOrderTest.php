@@ -124,6 +124,8 @@ class LateBorrowProbe
 
 class ReleaseOrderRecordingPool extends DatabasePool
 {
+    public int $pruneCalls = 0;
+
     public function __construct(protected ArrayObject $events)
     {
     }
@@ -135,6 +137,8 @@ class ReleaseOrderRecordingPool extends DatabasePool
 
     public function pruneIdleConnections(?float $now = null): int
     {
+        $this->pruneCalls++;
+
         return 0;
     }
 }

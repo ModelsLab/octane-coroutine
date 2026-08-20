@@ -29,6 +29,20 @@ class DatabasePool
     protected array $connectionConfig;
     protected array $idleSince = [];
     protected array $createdAt = [];
+    protected array $borrowedSince = [];
+
+    /**
+     * Weak references to every connection this pool created and has not
+     * closed. A borrower that drops its connection without release() (a
+     * child coroutine ending, app code deleting the context entry) leaves
+     * the counter incremented for a connection that no longer exists;
+     * reconcileVanishedConnections() detects the dead reference and heals
+     * the slot instead of letting the pool drift toward false exhaustion.
+     *
+     * @var array<int, \WeakReference<object>>
+     */
+    protected array $liveConnections = [];
+
     protected ?int $idlePruneTimerId = null;
 
     /**
@@ -209,6 +223,8 @@ class DatabasePool
      */
     public function pruneIdleConnections(?float $now = null): int
     {
+        $this->reconcileVanishedConnections();
+
         $maxIdleTime = (float) ($this->config['max_idle_time'] ?? 60.0);
         $minConnections = (int) ($this->config['min_connections'] ?? 1);
 
@@ -340,12 +356,61 @@ class DatabasePool
     }
 
     /**
-     * Safely close a connection
+     * Start tracking a freshly created connection.
+     *
+     * PHP reuses object ids. If the previous occupant of this id is a
+     * tracked connection that died while factory->make() was connecting
+     * (allocation-triggered gc can run inside make, and the freed slot is
+     * handed to the next allocation), overwriting its weak reference would
+     * strand that slot's counter increment forever. Heal it on overwrite.
+     */
+    protected function trackConnection(object $connection): void
+    {
+        $id = spl_object_id($connection);
+
+        if (isset($this->liveConnections[$id]) && $this->liveConnections[$id]->get() === null) {
+            unset($this->liveConnections[$id], $this->idleSince[$id], $this->borrowedSince[$id], $this->createdAt[$id]);
+            $this->currentConnections--;
+            error_log('⚠️ DB pool healed a connection slot dropped without release (object id reused)');
+        }
+
+        $this->createdAt[$id] = microtime(true);
+        $this->liveConnections[$id] = \WeakReference::create($connection);
+    }
+
+    /**
+     * Decrement the counter for connections that were garbage-collected
+     * without passing through release()/closeConnection().
+     */
+    public function reconcileVanishedConnections(): int
+    {
+        $healed = 0;
+
+        foreach ($this->liveConnections as $id => $ref) {
+            if ($ref->get() !== null) {
+                continue;
+            }
+
+            unset($this->liveConnections[$id], $this->idleSince[$id], $this->createdAt[$id], $this->borrowedSince[$id]);
+            $this->currentConnections--;
+            $healed++;
+        }
+
+        if ($healed > 0) {
+            error_log("⚠️ DB pool healed {$healed} connection slot(s) dropped without release");
+        }
+
+        return $healed;
+    }
+
+    /**
+     * Safely close a connection and drop its tracking state.
      */
     protected function closeConnection($connection): void
     {
         if (is_object($connection)) {
-            unset($this->createdAt[spl_object_id($connection)]);
+            $id = spl_object_id($connection);
+            unset($this->createdAt[$id], $this->liveConnections[$id], $this->borrowedSince[$id]);
         }
 
         try {
@@ -410,13 +475,15 @@ class DatabasePool
      */
     protected function createConnection()
     {
+        $this->reconcileVanishedConnections();
+
         $this->currentConnections++;
 
         try {
             $connection = $this->factory->make($this->connectionConfig, $this->name);
 
             if (is_object($connection)) {
-                $this->createdAt[spl_object_id($connection)] = microtime(true);
+                $this->trackConnection($connection);
             }
 
             if ($connection instanceof Connection) {
@@ -447,14 +514,18 @@ class DatabasePool
     protected function markIdle($connection): void
     {
         if (is_object($connection)) {
-            $this->idleSince[spl_object_id($connection)] = microtime(true);
+            $id = spl_object_id($connection);
+            $this->idleSince[$id] = microtime(true);
+            unset($this->borrowedSince[$id]);
         }
     }
 
     protected function markBorrowed($connection): void
     {
         if (is_object($connection)) {
-            unset($this->idleSince[spl_object_id($connection)]);
+            $id = spl_object_id($connection);
+            unset($this->idleSince[$id]);
+            $this->borrowedSince[$id] = microtime(true);
         }
     }
 
@@ -514,6 +585,10 @@ class DatabasePool
      */
     public function getStats(): array
     {
+        // Heal first so a quiet pool does not report vanished borrowers as
+        // live or long-borrowed connections.
+        $this->reconcileVanishedConnections();
+
         return [
             'current_connections' => $this->currentConnections,
             'available_connections' => $this->channel->length(),
@@ -522,7 +597,32 @@ class DatabasePool
             'min_connections' => $this->config['min_connections'] ?? 1,
             'max_idle_time' => $this->config['max_idle_time'] ?? 60.0,
             'max_lifetime' => $this->config['max_lifetime'] ?? self::DEFAULT_MAX_LIFETIME,
+            'tracked_connections' => count($this->liveConnections),
+            'long_borrowed_connections' => $this->longBorrowedCount(),
         ];
+    }
+
+    /**
+     * Connections held by a borrower for longer than max_lifetime. The pool
+     * cannot recycle these (recycling happens at release), so a non-zero
+     * value points at a coroutine or daemon that never releases — the
+     * borrower should end its coroutine or call
+     * DatabaseManager::releaseConnections() periodically.
+     */
+    protected function longBorrowedCount(?float $now = null): int
+    {
+        $maxLifetime = (float) ($this->config['max_lifetime'] ?? self::DEFAULT_MAX_LIFETIME);
+
+        if ($maxLifetime <= 0) {
+            return 0;
+        }
+
+        $now ??= microtime(true);
+
+        return count(array_filter(
+            $this->borrowedSince,
+            static fn (float $since): bool => ($now - $since) >= $maxLifetime
+        ));
     }
 
     protected function startIdlePruner(): void
