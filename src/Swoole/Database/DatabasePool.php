@@ -98,12 +98,20 @@ class DatabasePool
         $waitTimeout = $this->config['wait_timeout'] ?? 3.0;
         $maxConnections = $this->config['max_connections'] ?? 10;
 
-        // Fast path: try a non-blocking pop first to avoid unnecessary waits.
-        $connection = $this->channel->pop(0.001);
+        // Fast path: only pop when something is pooled - popping an empty
+        // channel costs a 1ms scheduler wait before checkout can create.
+        $connection = $this->channel->length() > 0 ? $this->channel->pop(0.001) : false;
 
         if ($connection === false) {
             // If we can grow the pool, create immediately instead of waiting.
             if ($this->currentConnections < $maxConnections) {
+                $connection = $this->createConnection();
+            } elseif ($this->reconcileVanishedConnections() > 0
+                && $this->currentConnections < $maxConnections) {
+                // The throttled prune no longer reconciles on every checkout,
+                // so a borrower that died without releasing could otherwise
+                // pin the counter at max for up to prune_interval - turning
+                // healable slots into 3s waits and pool-exhausted 500s.
                 $connection = $this->createConnection();
             } else {
                 // Pool is at max; wait for a connection to be released.
@@ -239,6 +247,21 @@ class DatabasePool
      */
     public function pruneIdleConnections(?float $now = null): int
     {
+        // get() and release() both prune opportunistically, so a busy pool
+        // would otherwise pay the full drain-and-refill walk several times
+        // per request. Worse, while the drain holds idle connections in a
+        // local array, a concurrent checkout that yields into an empty
+        // channel creates a brand-new connection it never needed. Once a
+        // second is plenty; the heartbeat timer stays the primary pruner.
+        $interval = (float) ($this->config['prune_interval'] ?? 1.0);
+        $clock = $now ?? microtime(true);
+
+        if ($interval > 0 && ($clock - $this->lastPruneAt) < $interval) {
+            return 0;
+        }
+
+        $this->lastPruneAt = $clock;
+
         $this->reconcileVanishedConnections();
 
         $maxIdleTime = (float) ($this->config['max_idle_time'] ?? 60.0);
@@ -336,18 +359,17 @@ class DatabasePool
                     $connection->setReadWriteType(null);
                 }
 
-                // Reset session variables for MySQL
+                // No session SQL for MySQL here: nothing in a request can
+                // change the isolation level, and the autocommit variable
+                // never changes either - PDO::beginTransaction runs START
+                // TRANSACTION, which suspends autocommit for that transaction
+                // without touching the session variable. normalizeSession()
+                // covers the two moments a session actually IS new - creation
+                // and the reconnector's PDO swap. Re-SETting on every release
+                // was measured at 45 statement-pairs/s in production, each
+                // pair holding the connection out of the pool for two round
+                // trips.
                 $driver = $connection->getDriverName();
-                if (in_array($driver, ['mysql', 'mariadb'])) {
-                    try {
-                        // Reset session state
-                        $pdo->exec('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
-                        $pdo->exec('SET autocommit = 1');
-                    } catch (Throwable $e) {
-                        // Non-critical, log and continue
-                        error_log('⚠️ Could not reset MySQL session: '.$e->getMessage());
-                    }
-                }
 
                 // For PostgreSQL
                 if ($driver === 'pgsql') {
@@ -483,8 +505,17 @@ class DatabasePool
 
         try {
             $pdo = $connection->getPdo();
-            $pdo->exec('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
-            $pdo->exec('SET autocommit = 1');
+
+            if ($connection->getDriverName() === 'mariadb') {
+                // MariaDB before 11.1.1 has no transaction_isolation system
+                // variable (MDEV-21921), so the combined assignment errors
+                // wholesale there. The standard-SQL form works everywhere,
+                // and this only runs when a session is created.
+                $pdo->exec('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+                $pdo->exec('SET autocommit = 1');
+            } else {
+                $pdo->exec("SET SESSION transaction_isolation = 'REPEATABLE-READ', SESSION autocommit = 1");
+            }
         } catch (Throwable $e) {
             error_log('⚠️ Could not normalize fresh MySQL session: '.$e->getMessage());
         }
@@ -539,8 +570,12 @@ class DatabasePool
                     $connection->setPdo($fresh->getRawPdo())
                         ->setReadPdo($fresh->getRawReadPdo());
 
-                    // The server session is brand new, so restart the
-                    // max_lifetime clock along with it.
+                    // The server session is brand new: normalize it exactly
+                    // like a created connection, and restart the max_lifetime
+                    // clock along with it. Release no longer re-SETs session
+                    // state, so this is the only thing keeping a reconnected
+                    // session at the pool's isolation level.
+                    $this->normalizeSession($connection);
                     $this->createdAt[spl_object_id($connection)] = microtime(true);
                 });
             }
@@ -710,6 +745,11 @@ class DatabasePool
             static fn (float $since): bool => ($now - $since) >= $maxLifetime
         ));
     }
+
+    /**
+     * When the last full prune pass ran, for the opportunistic-prune throttle.
+     */
+    protected float $lastPruneAt = 0.0;
 
     protected function startIdlePruner(): void
     {

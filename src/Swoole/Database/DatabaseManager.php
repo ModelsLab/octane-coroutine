@@ -83,6 +83,16 @@ class DatabaseManager extends BaseDatabaseManager
 
         \Swoole\Coroutine::defer(function (): void {
             try {
+                // The gc exists to close statement cycles against a
+                // connection this coroutine is about to release. When the
+                // Worker already released everything (the normal request
+                // path), there is nothing to protect - and the root buffer
+                // is process-global, so the old unconditional check made
+                // this a full cycle-collection on every DB request.
+                if (! $this->contextHoldsPooledConnections()) {
+                    return;
+                }
+
                 if (gc_status()['roots'] > 0) {
                     gc_collect_cycles();
                 }
@@ -92,6 +102,20 @@ class DatabaseManager extends BaseDatabaseManager
                 error_log('⚠️ Failed to release DB connections at coroutine exit: '.$e->getMessage());
             }
         });
+    }
+
+    /**
+     * Whether this coroutine's context still holds pool-borrowed connections.
+     */
+    protected function contextHoldsPooledConnections(): bool
+    {
+        foreach (Context::all() as $key => $value) {
+            if (str_ends_with($key, '.pool')) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     protected function getPool($name)

@@ -201,6 +201,20 @@ return [
     'swoole' => [
         /*
         |--------------------------------------------------------------------------
+        | Request Timeout Sweep Interval
+        |--------------------------------------------------------------------------
+        |
+        | How often (ms) the server scans in-flight requests for ones that
+        | exceeded max_execution_time. Coarser is cheaper: a request can
+        | overrun its budget by at most one interval. Clamped to >= 1000.
+        |
+        */
+
+        'timeout_sweep_interval_ms' => env('OCTANE_TIMEOUT_SWEEP_INTERVAL_MS', 5000),
+
+
+        /*
+        |--------------------------------------------------------------------------
         | Database Connection Safety Buffer
         |--------------------------------------------------------------------------
         |
