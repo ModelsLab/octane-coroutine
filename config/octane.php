@@ -39,6 +39,22 @@ return [
 
     'mysql_string_bindings' => env('OCTANE_MYSQL_STRING_BINDINGS', true),
 
+    /*
+    |--------------------------------------------------------------------------
+    | MySQL Prepared-Statement Cache
+    |--------------------------------------------------------------------------
+    |
+    | Reuse prepared statements per pooled connection (LRU, keyed by SQL).
+    | Saves one COM_STMT_PREPARE round trip plus parse work on every
+    | repeated query. Flushed automatically when the underlying PDO is
+    | swapped. Watch Prepared_stmt_count server-side when raising the size.
+    |
+    */
+
+    'mysql_statement_cache' => env('OCTANE_MYSQL_STMT_CACHE', true),
+
+    'mysql_statement_cache_size' => env('OCTANE_MYSQL_STMT_CACHE_SIZE', 64),
+
 
     /*
     |--------------------------------------------------------------------------
