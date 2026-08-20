@@ -115,18 +115,34 @@ class DatabasePool
             }
         }
 
+        $idleFor = $this->idleSeconds($connection);
+
         $this->markBorrowed($connection);
 
-        // Check if connection is still valid
-        if (! $this->checkConnection($connection)) {
-            $connection = $this->reconnect($connection);
+        // Ping only connections that sat idle long enough for the server to
+        // have plausibly dropped them. Every pooled connection was released
+        // moments-to-seconds ago on a busy pool, and the ping is a full
+        // round-trip to the database (measured ~10-20ms from Cloud Run to the
+        // DB host) paid on every request. Connections created on demand have
+        // no idle timestamp yet and skip the ping. A connection that died while
+        // idle still gets caught: the first real query fails and the
+        // reconnector swaps in a fresh PDO.
+        if ($idleFor !== null && $idleFor >= $this->pingAfterIdleSeconds()) {
+            if (! $this->checkConnection($connection)) {
+                $connection = $this->reconnect($connection);
+            }
         }
 
-        // Defensive cleanup on checkout as well as release. If a previous
-        // request left PDO or Laravel transaction state dirty, never hand that
-        // connection to the next coroutine.
+        // release() fully resets every connection before re-pooling it and
+        // closes any connection whose reset fails, so pooled connections are
+        // clean by invariant and the checkout-side session SQL (two more
+        // round-trips per borrow) is redundant. The local transaction checks
+        // below cost no SQL; only a genuinely dirty connection - e.g. handed
+        // to us dirty by the factory - pays for a full reset.
         try {
-            $this->resetConnection($connection);
+            if ($this->hasDirtyTransactionState($connection)) {
+                $this->resetConnection($connection);
+            }
         } catch (Throwable $e) {
             error_log('❌ Dirty DB connection could not be reset on checkout: '.$e->getMessage());
             $this->closeConnection($connection);
@@ -451,6 +467,30 @@ class DatabasePool
     }
 
     /**
+     * Force a fresh connection into the same session state resetConnection()
+     * leaves recycled ones in. Checkout no longer re-runs the session SQL,
+     * so fresh and recycled connections must be indistinguishable: without
+     * this, a server whose global isolation level or autocommit differs from
+     * these values would hand out connections whose behavior depends on
+     * whether they happen to be fresh - nondeterministic snapshot and
+     * gap-lock semantics per request.
+     */
+    protected function normalizeSession(Connection $connection): void
+    {
+        if (! in_array($connection->getDriverName(), ['mysql', 'mariadb'], true)) {
+            return;
+        }
+
+        try {
+            $pdo = $connection->getPdo();
+            $pdo->exec('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+            $pdo->exec('SET autocommit = 1');
+        } catch (Throwable $e) {
+            error_log('⚠️ Could not normalize fresh MySQL session: '.$e->getMessage());
+        }
+    }
+
+    /**
      * Whether a connection is older than the pool's max_lifetime.
      *
      * A value of 0 or less disables lifetime recycling. Connections without a
@@ -487,6 +527,8 @@ class DatabasePool
             }
 
             if ($connection instanceof Connection) {
+                $this->normalizeSession($connection);
+
                 // Without a reconnector, Connection::reconnect() throws
                 // LostConnectionException and the pool silently discards and
                 // rebuilds the connection on every stale checkout. Swapping the
@@ -509,6 +551,50 @@ class DatabasePool
 
             throw $e;
         }
+    }
+
+    /**
+     * Seconds this connection has sat idle in the pool, or null when unknown
+     * (freshly created connections have no idle timestamp).
+     */
+    protected function idleSeconds($connection): ?float
+    {
+        if (! is_object($connection)) {
+            return null;
+        }
+
+        $since = $this->idleSince[spl_object_id($connection)] ?? null;
+
+        return $since === null ? null : microtime(true) - $since;
+    }
+
+    /**
+     * Idle age beyond which a checkout pings the server before handing the
+     * connection out. 0 or negative pings on every checkout of a pooled
+     * connection (freshly created ones never ping - they just connected).
+     */
+    protected function pingAfterIdleSeconds(): float
+    {
+        return (float) ($this->config['ping_after_idle'] ?? 30.0);
+    }
+
+    /**
+     * Local-only dirty check: no SQL, just the Laravel counter and the PDO
+     * driver flag.
+     */
+    protected function hasDirtyTransactionState($connection): bool
+    {
+        if (! $connection instanceof Connection) {
+            return false;
+        }
+
+        if ($connection->transactionLevel() > 0) {
+            return true;
+        }
+
+        $pdo = $connection->getRawPdo();
+
+        return $pdo instanceof \PDO && $pdo->inTransaction();
     }
 
     protected function markIdle($connection): void

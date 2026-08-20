@@ -109,6 +109,7 @@ class DatabaseManager extends BaseDatabaseManager
                 'heartbeat' => -1,
                 'max_idle_time' => 60.0,
                 'max_lifetime' => DatabasePool::DEFAULT_MAX_LIFETIME,
+                'ping_after_idle' => 30.0,
             ];
 
             $this->pools[$name] = new DatabasePool(
