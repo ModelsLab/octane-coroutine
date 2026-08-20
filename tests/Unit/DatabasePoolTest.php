@@ -608,6 +608,81 @@ class DatabasePoolTest extends TestCase
         $this->assertSame(0, $stats['current_connections']);
     }
 
+    public function test_reconcile_heals_slots_for_connections_dropped_without_release(): void
+    {
+        $this->skipIfNoSwooleCoroutine();
+
+        if (! extension_loaded('pdo_sqlite')) {
+            $this->markTestSkipped('PDO SQLite is required.');
+        }
+
+        $factory = Mockery::mock(ConnectionFactory::class);
+        $factory->shouldReceive('make')
+            ->once()
+            ->withAnyArgs()
+            ->andReturnUsing(fn () => new Connection(new PDO('sqlite::memory:'), 'database', '', []));
+
+        $healed = null;
+        $stats = null;
+
+        \Swoole\Coroutine\run(function () use ($factory, &$healed, &$stats) {
+            $pool = new DatabasePool([
+                'min_connections' => 0,
+                'max_connections' => 2,
+                'wait_timeout' => 0.1,
+                'max_lifetime' => 60.0,
+            ], [], 'sqlite', $factory);
+
+            $connection = $pool->get();
+            $this->assertSame(1, $pool->getStats()['current_connections']);
+
+            // A borrower that vanishes without release() - e.g. a child
+            // coroutine whose context died with the connection inside it.
+            unset($connection);
+            gc_collect_cycles();
+
+            $healed = $pool->reconcileVanishedConnections();
+            $stats = $pool->getStats();
+        });
+
+        $this->assertSame(1, $healed, 'The vanished connection must be detected via its dead weak reference.');
+        $this->assertSame(0, $stats['current_connections'], 'The slot must be reclaimed so the pool cannot drift into false exhaustion.');
+        $this->assertSame(0, $stats['tracked_connections']);
+    }
+
+    public function test_reconcile_leaves_live_connections_alone(): void
+    {
+        $this->skipIfNoSwooleCoroutine();
+
+        if (! extension_loaded('pdo_sqlite')) {
+            $this->markTestSkipped('PDO SQLite is required.');
+        }
+
+        $factory = Mockery::mock(ConnectionFactory::class);
+        $factory->shouldReceive('make')
+            ->once()
+            ->withAnyArgs()
+            ->andReturnUsing(fn () => new Connection(new PDO('sqlite::memory:'), 'database', '', []));
+
+        \Swoole\Coroutine\run(function () use ($factory) {
+            $pool = new DatabasePool([
+                'min_connections' => 0,
+                'max_connections' => 2,
+                'wait_timeout' => 0.1,
+                'max_lifetime' => 60.0,
+            ], [], 'sqlite', $factory);
+
+            $connection = $pool->get();
+            gc_collect_cycles();
+
+            $this->assertSame(0, $pool->reconcileVanishedConnections(), 'A held connection must never be treated as vanished.');
+            $this->assertSame(1, $pool->getStats()['current_connections']);
+
+            $pool->release($connection);
+            $this->assertSame(1, $pool->getStats()['current_connections']);
+        });
+    }
+
     protected function newPoolWithoutConstructor(): DatabasePool
     {
         $reflection = new \ReflectionClass(DatabasePool::class);

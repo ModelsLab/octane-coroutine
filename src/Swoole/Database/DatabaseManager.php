@@ -41,7 +41,43 @@ class DatabaseManager extends BaseDatabaseManager
         Context::set($contextKey, $connection);
         Context::set("{$contextKey}.pool", $pool);
 
+        $this->armCoroutineExitRelease();
+
         return $connection;
+    }
+
+    /**
+     * Release whatever this coroutine still holds when it ends.
+     *
+     * Worker::handle() releases the HTTP request coroutine's connections
+     * itself (with garbage-collected-first ordering), so this defer is a
+     * no-op there: the context is already empty when it fires. It exists for
+     * every OTHER borrower — child coroutines spawned by app code and
+     * coroutine-based daemons — whose borrows the Worker never sees. Without
+     * it those connections bypass release(), the pool's counter drifts up
+     * one slot per borrow until "Connection pool exhausted", and a long-lived
+     * borrower accumulates leaked server-side prepared statements that
+     * max_lifetime recycling can never reach.
+     *
+     * Statements such a coroutine leaves in cycle garbage may still be
+     * destroyed after this release (there is no safe point to collect them
+     * here) — that residue stays bounded by the pool's max_lifetime.
+     */
+    protected function armCoroutineExitRelease(): void
+    {
+        if (Context::get('db.exit_release_armed')) {
+            return;
+        }
+
+        Context::set('db.exit_release_armed', true);
+
+        \Swoole\Coroutine::defer(function (): void {
+            try {
+                $this->releaseConnections();
+            } catch (\Throwable $e) {
+                error_log('⚠️ Failed to release DB connections at coroutine exit: '.$e->getMessage());
+            }
+        });
     }
 
     protected function getPool($name)
