@@ -27,6 +27,21 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | MySQL Integer Bindings as Strings
+    |--------------------------------------------------------------------------
+    |
+    | MySQL 9.0.x re-prepares statements on every execute that carries an
+    | integer-typed parameter (mysqlnd silently retries: two extra round
+    | trips per int-bound query). Binding integers as strings avoids it with
+    | identical plans and results.
+    |
+    */
+
+    'mysql_string_bindings' => env('OCTANE_MYSQL_STRING_BINDINGS', true),
+
+
+    /*
+    |--------------------------------------------------------------------------
     | Octane Server
     |--------------------------------------------------------------------------
     |
