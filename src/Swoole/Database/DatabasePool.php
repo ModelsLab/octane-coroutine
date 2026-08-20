@@ -123,8 +123,8 @@ class DatabasePool
         // have plausibly dropped them. Every pooled connection was released
         // moments-to-seconds ago on a busy pool, and the ping is a full
         // round-trip to the database (measured ~10-20ms from Cloud Run to the
-        // DB host) paid on every request. Freshly created connections have no
-        // idle timestamp and skip the ping too. A connection that died while
+        // DB host) paid on every request. Connections created on demand have
+        // no idle timestamp yet and skip the ping. A connection that died while
         // idle still gets caught: the first real query fails and the
         // reconnector swaps in a fresh PDO.
         if ($idleFor !== null && $idleFor >= $this->pingAfterIdleSeconds()) {
@@ -467,6 +467,30 @@ class DatabasePool
     }
 
     /**
+     * Force a fresh connection into the same session state resetConnection()
+     * leaves recycled ones in. Checkout no longer re-runs the session SQL,
+     * so fresh and recycled connections must be indistinguishable: without
+     * this, a server whose global isolation level or autocommit differs from
+     * these values would hand out connections whose behavior depends on
+     * whether they happen to be fresh - nondeterministic snapshot and
+     * gap-lock semantics per request.
+     */
+    protected function normalizeSession(Connection $connection): void
+    {
+        if (! in_array($connection->getDriverName(), ['mysql', 'mariadb'], true)) {
+            return;
+        }
+
+        try {
+            $pdo = $connection->getPdo();
+            $pdo->exec('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+            $pdo->exec('SET autocommit = 1');
+        } catch (Throwable $e) {
+            error_log('⚠️ Could not normalize fresh MySQL session: '.$e->getMessage());
+        }
+    }
+
+    /**
      * Whether a connection is older than the pool's max_lifetime.
      *
      * A value of 0 or less disables lifetime recycling. Connections without a
@@ -503,6 +527,8 @@ class DatabasePool
             }
 
             if ($connection instanceof Connection) {
+                $this->normalizeSession($connection);
+
                 // Without a reconnector, Connection::reconnect() throws
                 // LostConnectionException and the pool silently discards and
                 // rebuilds the connection on every stale checkout. Swapping the
@@ -544,8 +570,8 @@ class DatabasePool
 
     /**
      * Idle age beyond which a checkout pings the server before handing the
-     * connection out. 0 or negative restores the old ping-every-checkout
-     * behavior.
+     * connection out. 0 or negative pings on every checkout of a pooled
+     * connection (freshly created ones never ping - they just connected).
      */
     protected function pingAfterIdleSeconds(): float
     {
@@ -566,7 +592,7 @@ class DatabasePool
             return true;
         }
 
-        $pdo = $connection->getPdo();
+        $pdo = $connection->getRawPdo();
 
         return $pdo instanceof \PDO && $pdo->inTransaction();
     }

@@ -377,6 +377,7 @@ class DatabasePoolTest extends TestCase
         // Illuminate\Database\DatabaseManager::configure() does.
         foreach ($connections as $connection) {
             $connection->shouldReceive('setReconnector')->once();
+            $connection->shouldReceive('getDriverName')->andReturn('sqlite');
         }
 
         $factory = Mockery::mock(ConnectionFactory::class);
@@ -830,6 +831,43 @@ class DatabasePoolTest extends TestCase
             $this->assertSame(0, $handed->transactionLevel(), 'A dirty pooled connection must still be reset at checkout.');
             $this->assertFalse($pdo->inTransaction());
         });
+    }
+
+    public function test_fresh_mysql_connections_get_the_same_session_normalization_as_recycled_ones(): void
+    {
+        $this->skipIfNoSwooleCoroutine();
+
+        $pdo = Mockery::mock(PDO::class);
+        $pdo->shouldReceive('exec')->with('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ')->once();
+        $pdo->shouldReceive('exec')->with('SET autocommit = 1')->once();
+        $pdo->shouldReceive('query')->andReturn(true);
+        $pdo->shouldReceive('inTransaction')->andReturn(false);
+
+        $connection = Mockery::mock(Connection::class);
+        $connection->shouldReceive('getDriverName')->andReturn('mysql');
+        $connection->shouldReceive('getPdo')->andReturn($pdo);
+        $connection->shouldReceive('getRawPdo')->andReturn($pdo);
+        $connection->shouldReceive('setReconnector')->once();
+        $connection->shouldReceive('transactionLevel')->andReturn(0);
+
+        $factory = Mockery::mock(ConnectionFactory::class);
+        $factory->shouldReceive('make')->once()->withAnyArgs()->andReturn($connection);
+
+        $result = null;
+
+        \Swoole\Coroutine\run(function () use ($factory, &$result) {
+            $pool = new DatabasePool([
+                'min_connections' => 0,
+                'max_connections' => 1,
+                'wait_timeout' => 0.1,
+            ], [], 'mysql', $factory);
+
+            $result = $pool->get();
+        });
+
+        $this->assertSame($connection, $result);
+        // Mockery's ->once() expectations on the two SETs are the assertions:
+        // checkout no longer homogenizes sessions, so creation must.
     }
 
     protected function newPoolWithoutConstructor(): DatabasePool
