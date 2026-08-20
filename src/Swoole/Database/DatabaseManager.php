@@ -59,9 +59,19 @@ class DatabaseManager extends BaseDatabaseManager
      * borrower accumulates leaked server-side prepared statements that
      * max_lifetime recycling can never reach.
      *
-     * Statements such a coroutine leaves in cycle garbage may still be
-     * destroyed after this release (there is no safe point to collect them
-     * here) — that residue stays bounded by the pool's max_lifetime.
+     * The defer collects the coroutine's cycle garbage before releasing:
+     * locals are already destroyed when defers run, so any PDOStatement the
+     * coroutine still references lives in a cycle, and collecting now closes
+     * it against a connection that is still idle and unborrowable — the same
+     * safe-point ordering the Worker uses. Garbage that only becomes
+     * collectable later stays bounded by the pool's max_lifetime.
+     *
+     * If Context::clear() runs mid-coroutine (the Worker does this once per
+     * request), the armed flag is lost and a later borrow arms a second
+     * defer. Both run at exit; the second walk finds an empty context and is
+     * a cheap no-op, so the stacking is bounded and harmless for the request
+     * path. Daemon loops that clear context repeatedly should release
+     * explicitly via releaseConnections() instead of relying on this hook.
      */
     protected function armCoroutineExitRelease(): void
     {
@@ -73,6 +83,10 @@ class DatabaseManager extends BaseDatabaseManager
 
         \Swoole\Coroutine::defer(function (): void {
             try {
+                if (gc_status()['roots'] > 0) {
+                    gc_collect_cycles();
+                }
+
                 $this->releaseConnections();
             } catch (\Throwable $e) {
                 error_log('⚠️ Failed to release DB connections at coroutine exit: '.$e->getMessage());
@@ -172,6 +186,8 @@ class DatabaseManager extends BaseDatabaseManager
             return;
         }
 
+        $released = 0;
+
         // Get all context keys and release connections
         $allContext = Context::all();
         foreach ($allContext as $key => $value) {
@@ -179,19 +195,26 @@ class DatabaseManager extends BaseDatabaseManager
                 // Get the connection
                 $connectionKey = substr($key, 0, -strlen('.pool'));
                 $connection = Context::get($connectionKey);
-                
+
                 if ($connection && $value instanceof DatabasePool) {
                     // Release connection back to pool
                     $value->release($connection);
+                    $released++;
                 }
-                
+
                 // Clean up context
                 Context::delete($key);
                 Context::delete($connectionKey);
             }
         }
 
-        $this->pruneIdleConnections();
+        // Pruning drains and refills every pool's channel; skip it when this
+        // walk found nothing - the request path already released and pruned
+        // through the Worker, and its exit defer would otherwise pay a full
+        // no-op prune on every request.
+        if ($released > 0) {
+            $this->pruneIdleConnections();
+        }
     }
 
     public function pruneIdleConnections(): int

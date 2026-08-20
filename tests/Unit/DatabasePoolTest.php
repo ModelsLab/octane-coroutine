@@ -683,6 +683,34 @@ class DatabasePoolTest extends TestCase
         });
     }
 
+    public function test_tracking_a_new_connection_heals_a_reused_object_id(): void
+    {
+        $pool = $this->newPoolWithoutConstructor();
+
+        $abandoned = new \stdClass();
+        $reusedId = spl_object_id($abandoned);
+
+        $live = new \ReflectionProperty(DatabasePool::class, 'liveConnections');
+        $live->setValue($pool, [$reusedId => \WeakReference::create($abandoned)]);
+        $this->setPoolCurrentConnections($pool, 1);
+
+        // The abandoned connection dies while factory->make() is connecting;
+        // PHP hands its object id to the next same-shape allocation.
+        unset($abandoned);
+        $fresh = new \stdClass();
+
+        if (spl_object_id($fresh) !== $reusedId) {
+            $this->markTestSkipped('Allocator did not reuse the object id on this build.');
+        }
+
+        $track = new ReflectionMethod(DatabasePool::class, 'trackConnection');
+        $track->invoke($pool, $fresh);
+
+        $current = new \ReflectionProperty(DatabasePool::class, 'currentConnections');
+        $this->assertSame(0, $current->getValue($pool), 'Overwriting a dead weak reference must heal the abandoned slot, or the drift becomes permanently unhealable.');
+        $this->assertSame($fresh, $live->getValue($pool)[$reusedId]->get());
+    }
+
     protected function newPoolWithoutConstructor(): DatabasePool
     {
         $reflection = new \ReflectionClass(DatabasePool::class);

@@ -356,8 +356,28 @@ class DatabasePool
     }
 
     /**
-     * Safely close a connection
+     * Start tracking a freshly created connection.
+     *
+     * PHP reuses object ids. If the previous occupant of this id is a
+     * tracked connection that died while factory->make() was connecting
+     * (allocation-triggered gc can run inside make, and the freed slot is
+     * handed to the next allocation), overwriting its weak reference would
+     * strand that slot's counter increment forever. Heal it on overwrite.
      */
+    protected function trackConnection(object $connection): void
+    {
+        $id = spl_object_id($connection);
+
+        if (isset($this->liveConnections[$id]) && $this->liveConnections[$id]->get() === null) {
+            unset($this->liveConnections[$id], $this->idleSince[$id], $this->borrowedSince[$id], $this->createdAt[$id]);
+            $this->currentConnections--;
+            error_log('⚠️ DB pool healed a connection slot dropped without release (object id reused)');
+        }
+
+        $this->createdAt[$id] = microtime(true);
+        $this->liveConnections[$id] = \WeakReference::create($connection);
+    }
+
     /**
      * Decrement the counter for connections that were garbage-collected
      * without passing through release()/closeConnection().
@@ -383,6 +403,9 @@ class DatabasePool
         return $healed;
     }
 
+    /**
+     * Safely close a connection and drop its tracking state.
+     */
     protected function closeConnection($connection): void
     {
         if (is_object($connection)) {
@@ -452,8 +475,6 @@ class DatabasePool
      */
     protected function createConnection()
     {
-        // Heal first so a recycled spl_object_id cannot overwrite the weak
-        // reference of a vanished connection before its slot is reclaimed.
         $this->reconcileVanishedConnections();
 
         $this->currentConnections++;
@@ -462,9 +483,7 @@ class DatabasePool
             $connection = $this->factory->make($this->connectionConfig, $this->name);
 
             if (is_object($connection)) {
-                $id = spl_object_id($connection);
-                $this->createdAt[$id] = microtime(true);
-                $this->liveConnections[$id] = \WeakReference::create($connection);
+                $this->trackConnection($connection);
             }
 
             if ($connection instanceof Connection) {
@@ -566,6 +585,10 @@ class DatabasePool
      */
     public function getStats(): array
     {
+        // Heal first so a quiet pool does not report vanished borrowers as
+        // live or long-borrowed connections.
+        $this->reconcileVanishedConnections();
+
         return [
             'current_connections' => $this->currentConnections,
             'available_connections' => $this->channel->length(),
