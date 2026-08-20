@@ -277,6 +277,7 @@ class DatabasePoolTest extends TestCase
                 'min_connections' => 1,
                 'max_connections' => 1,
                 'wait_timeout' => 0.1,
+                'ping_after_idle' => 0,
             ], [], 'mysql', $factory);
 
             $result = $pool->get();
@@ -711,6 +712,126 @@ class DatabasePoolTest extends TestCase
         $this->assertSame($fresh, $live->getValue($pool)[$reusedId]->get());
     }
 
+    public function test_checkout_skips_ping_and_session_reset_for_recently_pooled_connection(): void
+    {
+        $this->skipIfNoSwooleCoroutine();
+
+        if (! extension_loaded('pdo_sqlite')) {
+            $this->markTestSkipped('PDO SQLite is required.');
+        }
+
+        $factory = Mockery::mock(ConnectionFactory::class);
+        $factory->shouldReceive('make')
+            ->once()
+            ->withAnyArgs()
+            ->andReturnUsing(fn () => new Connection(new CountingSqlitePdo('sqlite::memory:'), 'database', '', []));
+
+        \Swoole\Coroutine\run(function () use ($factory) {
+            $pool = new DatabasePool([
+                'min_connections' => 0,
+                'max_connections' => 1,
+                'wait_timeout' => 0.1,
+                'max_lifetime' => 60.0,
+                'ping_after_idle' => 30.0,
+            ], [], 'sqlite', $factory);
+
+            $connection = $pool->get();
+            $pool->release($connection);
+
+            // Probe: resetConnection flushes the query log; a surviving entry
+            // proves the checkout skipped the redundant session reset.
+            $connection->enableQueryLog();
+            $connection->logQuery('probe', [], 0);
+            $pings = $connection->getPdo()->queryCalls;
+
+            $again = $pool->get();
+
+            $this->assertSame($connection, $again);
+            $this->assertSame($pings, $connection->getPdo()->queryCalls, 'A connection idle for milliseconds must not be pinged on checkout.');
+            $this->assertCount(1, $connection->getQueryLog(), 'A clean pooled connection must not pay the session reset on checkout.');
+        });
+    }
+
+    public function test_checkout_pings_connection_idle_beyond_threshold(): void
+    {
+        $this->skipIfNoSwooleCoroutine();
+
+        if (! extension_loaded('pdo_sqlite')) {
+            $this->markTestSkipped('PDO SQLite is required.');
+        }
+
+        $factory = Mockery::mock(ConnectionFactory::class);
+        $factory->shouldReceive('make')
+            ->once()
+            ->withAnyArgs()
+            ->andReturnUsing(fn () => new Connection(new CountingSqlitePdo('sqlite::memory:'), 'database', '', []));
+
+        \Swoole\Coroutine\run(function () use ($factory) {
+            $pool = new DatabasePool([
+                'min_connections' => 0,
+                'max_connections' => 1,
+                'wait_timeout' => 0.1,
+                'max_lifetime' => 600.0,
+                'max_idle_time' => 600.0,
+                'ping_after_idle' => 30.0,
+            ], [], 'sqlite', $factory);
+
+            $connection = $pool->get();
+            $pool->release($connection);
+
+            // Age the idle timestamp past the ping threshold.
+            $idle = new \ReflectionProperty(DatabasePool::class, 'idleSince');
+            $entries = $idle->getValue($pool);
+            foreach ($entries as $id => $since) {
+                $entries[$id] = $since - 120.0;
+            }
+            $idle->setValue($pool, $entries);
+
+            $pings = $connection->getPdo()->queryCalls;
+            $pool->get();
+
+            $this->assertGreaterThan($pings, $connection->getPdo()->queryCalls, 'A connection idle past ping_after_idle must be pinged before handout.');
+        });
+    }
+
+    public function test_checkout_still_resets_a_dirty_pooled_connection(): void
+    {
+        $this->skipIfNoSwooleCoroutine();
+
+        if (! extension_loaded('pdo_sqlite')) {
+            $this->markTestSkipped('PDO SQLite is required.');
+        }
+
+        $pdo = new PDO('sqlite::memory:');
+        $connection = new Connection($pdo, 'database', '', []);
+
+        $factory = Mockery::mock(ConnectionFactory::class);
+        $factory->shouldReceive('make')->never();
+
+        \Swoole\Coroutine\run(function () use ($factory, $connection, $pdo) {
+            $pool = new DatabasePool([
+                'min_connections' => 0,
+                'max_connections' => 1,
+                'wait_timeout' => 0.1,
+            ], [], 'sqlite', $factory);
+
+            // Plant a DIRTY connection straight into the channel, bypassing
+            // release() - simulating any path that re-pools without reset.
+            $connection->beginTransaction();
+            $channel = new \ReflectionProperty(DatabasePool::class, 'channel');
+            $channel->getValue($pool)->push($connection);
+            $this->setPoolCurrentConnections($pool, 1);
+            $live = new \ReflectionProperty(DatabasePool::class, 'liveConnections');
+            $live->setValue($pool, [spl_object_id($connection) => \WeakReference::create($connection)]);
+
+            $handed = $pool->get();
+
+            $this->assertSame($connection, $handed);
+            $this->assertSame(0, $handed->transactionLevel(), 'A dirty pooled connection must still be reset at checkout.');
+            $this->assertFalse($pdo->inTransaction());
+        });
+    }
+
     protected function newPoolWithoutConstructor(): DatabasePool
     {
         $reflection = new \ReflectionClass(DatabasePool::class);
@@ -743,6 +864,23 @@ class DatabasePoolTest extends TestCase
         if (!class_exists(\Swoole\Coroutine::class) || !function_exists('Swoole\\Coroutine\\run')) {
             $this->markTestSkipped('Swoole coroutine support is required.');
         }
+    }
+}
+
+class CountingSqlitePdo extends PDO
+{
+    public int $queryCalls = 0;
+
+    #[\ReturnTypeWillChange]
+    public function query(string $query, ?int $fetchMode = null, mixed ...$fetchModeArgs)
+    {
+        $this->queryCalls++;
+
+        if ($fetchMode === null) {
+            return parent::query($query);
+        }
+
+        return parent::query($query, $fetchMode, ...$fetchModeArgs);
     }
 }
 
