@@ -55,7 +55,7 @@ class OctaneServiceProvider extends ServiceProvider
         // production). Bind integers as strings instead - the server casts the
         // constant once, plans and results are identical. Escape hatch:
         // OCTANE_MYSQL_STRING_BINDINGS=false.
-        if (config('octane.mysql_string_bindings', true) !== false) {
+        if (filter_var(config('octane.mysql_string_bindings', true), FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) ?? true) {
             \Illuminate\Database\Connection::resolverFor('mysql', function ($connection, $database, $prefix, $config) {
                 return new \Laravel\Octane\Swoole\Database\MySqlStringBindingConnection($connection, $database, $prefix, $config);
             });

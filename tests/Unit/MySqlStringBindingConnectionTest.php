@@ -28,9 +28,13 @@ class MySqlStringBindingConnectionTest extends TestCase
         $statement->shouldReceive('bindValue')->once()->with(1, Mockery::mustBe('5'), PDO::PARAM_STR);
         $statement->shouldReceive('bindValue')->once()->with(2, Mockery::mustBe('abc'), PDO::PARAM_STR);
         $statement->shouldReceive('bindValue')->once()->with(3, Mockery::mustBe(null), PDO::PARAM_STR);
-        $statement->shouldReceive('bindValue')->once()->with('named', Mockery::mustBe('42'), PDO::PARAM_STR);
 
-        $connection->bindValues($statement, [5, 'abc', null, 'named' => 42]);
+        $connection->bindValues($statement, [5, 'abc', null]);
+
+        $named = Mockery::mock(\PDOStatement::class);
+        $named->shouldReceive('bindValue')->once()->with('named', Mockery::mustBe('42'), PDO::PARAM_STR);
+
+        $connection->bindValues($named, ['named' => 42]);
     }
 
     public function test_large_integers_stringify_losslessly(): void
