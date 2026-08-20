@@ -58,6 +58,7 @@ class DatabaseManager extends BaseDatabaseManager
                 'wait_timeout' => 3.0,
                 'heartbeat' => -1,
                 'max_idle_time' => 60.0,
+                'max_lifetime' => DatabasePool::DEFAULT_MAX_LIFETIME,
             ];
 
             $this->pools[$name] = new DatabasePool(
@@ -119,6 +120,16 @@ class DatabaseManager extends BaseDatabaseManager
         }
     }
 
+    /**
+     * Release this coroutine's pooled connections immediately.
+     *
+     * The Worker no longer uses this: it detaches connections, destroys the
+     * request's object graph, and only then releases, so statements held in
+     * cycle garbage cannot be destroyed while the connection is busy in
+     * another coroutine (which leaks the server-side prepared statement).
+     * Calling this mid-request re-pools connections without that ordering —
+     * only use it when no statement from this coroutine can still be alive.
+     */
     public function releaseConnections()
     {
         if (!Context::inCoroutine()) {
@@ -130,7 +141,7 @@ class DatabaseManager extends BaseDatabaseManager
         foreach ($allContext as $key => $value) {
             if (str_ends_with($key, '.pool')) {
                 // Get the connection
-                $connectionKey = str_replace('.pool', '', $key);
+                $connectionKey = substr($key, 0, -strlen('.pool'));
                 $connection = Context::get($connectionKey);
                 
                 if ($connection && $value instanceof DatabasePool) {
