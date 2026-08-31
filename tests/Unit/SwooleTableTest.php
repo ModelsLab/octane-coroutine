@@ -4,14 +4,13 @@ namespace Tests\Unit;
 
 use Laravel\Octane\Tables\OpenSwooleTable;
 use Laravel\Octane\Tables\SwooleTable;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Swoole\Table;
 
 class SwooleTableTest extends TestCase
 {
-    /**
-     * @dataProvider tableClasses
-     */
+    #[DataProvider('tableClasses')]
     public function test_set_preserves_the_requested_row_key(string $tableClass): void
     {
         if (! class_exists(Table::class)) {

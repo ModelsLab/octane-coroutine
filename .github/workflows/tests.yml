@@ -12,6 +12,22 @@ permissions:
 jobs:
   phpunit:
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: "8.3"
+            laravel: 11
+          - php: "8.3"
+            laravel: 12
+          - php: "8.3"
+            laravel: 13
+          - php: "8.4"
+            laravel: 13
+
+    name: PHP ${{ matrix.php }} - Laravel ${{ matrix.laravel }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,14 +35,16 @@ jobs:
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: "8.3"
+          php-version: "${{ matrix.php }}"
           extensions: swoole
           coverage: none
           tools: composer:v2
           cache: composer
 
       - name: Install dependencies
-        run: composer install --no-interaction --prefer-dist
+        run: |
+          composer require "laravel/framework:^${{ matrix.laravel }}.0" --no-interaction --no-update
+          composer update --no-interaction --prefer-dist
 
       - name: Run tests
         run: vendor/bin/phpunit -c phpunit.xml
