@@ -494,7 +494,7 @@ class CoroutineApplication extends Application
      * @param  \Closure|null  $callback
      * @return void
      */
-    public function beforeResolving($abstract, Closure $callback = null)
+    public function beforeResolving($abstract, ?Closure $callback = null)
     {
         parent::beforeResolving($abstract, $callback);
 
@@ -508,7 +508,7 @@ class CoroutineApplication extends Application
      * @param  \Closure|null  $callback
      * @return void
      */
-    public function resolving($abstract, Closure $callback = null)
+    public function resolving($abstract, ?Closure $callback = null)
     {
         parent::resolving($abstract, $callback);
 
@@ -522,7 +522,7 @@ class CoroutineApplication extends Application
      * @param  \Closure|null  $callback
      * @return void
      */
-    public function afterResolving($abstract, Closure $callback = null)
+    public function afterResolving($abstract, ?Closure $callback = null)
     {
         parent::afterResolving($abstract, $callback);
 

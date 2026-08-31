@@ -3,6 +3,9 @@
 namespace Laravel\Octane;
 
 use Exception;
+use Illuminate\Container\Container;
+use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Foundation\DevCommands;
 use Laravel\Octane\Swoole\WorkerState;
 use Swoole\Http\Server;
 use Swoole\Table;
@@ -53,5 +56,30 @@ class Octane
         }
 
         error_log($message, 4);
+    }
+
+    /**
+     * Register the Octane dev commands.
+     *
+     * Laravel 13's "artisan dev" command runs a set of registered processes.
+     * Registering Octane as the "server" process replaces the default
+     * "artisan serve" so the dev command boots Octane instead.
+     */
+    public static function registerDevCommands(): void
+    {
+        if (! class_exists(DevCommands::class)) {
+            return;
+        }
+
+        // DevCommands reaches for the container itself, so only register once a
+        // real application is bound. Octane builds sandbox containers of its
+        // own, and those are not always in place when this provider registers.
+        $app = Container::getInstance();
+
+        if (! $app instanceof Application) {
+            return;
+        }
+
+        DevCommands::artisan('octane:start --watch', 'server');
     }
 }
