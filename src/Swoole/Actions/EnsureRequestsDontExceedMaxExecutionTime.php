@@ -50,13 +50,22 @@ class EnsureRequestsDontExceedMaxExecutionTime
             // Delete the timer entry first
             $this->timerTable->del($coroutineId);
 
-            // Check if the connection still exists
+            $age = time() - $row['time'];
+
+            // Check if the connection still exists. Log this case too: a
+            // dead fd here means a downstream proxy already gave up on a
+            // request the worker is STILL burning - silence made a whole
+            // class of production stalls invisible (the 210s nginx 504s).
             if ($this->server instanceof Server && ! $this->server->exists($row['fd'])) {
+                error_log("⏱️ Request timeout (client gone): Coroutine #{$coroutineId} ran {$age}s of {$this->maxExecutionTime}s budget on worker {$row['worker_pid']}; fd {$row['fd']} already closed");
+
+                $this->cancelCoroutine($coroutineId);
+
                 continue;
             }
 
             // Log the timeout
-            error_log("⏱️ Request timeout: Coroutine #{$coroutineId} exceeded {$this->maxExecutionTime}s max execution time");
+            error_log("⏱️ Request timeout: Coroutine #{$coroutineId} ran {$age}s, exceeded {$this->maxExecutionTime}s max execution time (worker {$row['worker_pid']}, fd {$row['fd']})");
 
             $cancelled = $this->cancelCoroutine($coroutineId);
 

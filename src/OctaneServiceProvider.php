@@ -49,6 +49,21 @@ class OctaneServiceProvider extends ServiceProvider
             return new \Laravel\Octane\Swoole\Database\DatabaseManager($app, $app['db.factory']);
         });
 
+        // The custom mysql Connection carries two independently-gated
+        // features: string integer bindings (kills MySQL 9.0's per-execute
+        // reprepare; OCTANE_MYSQL_STRING_BINDINGS=false) and the prepared-
+        // statement cache (OCTANE_MYSQL_STMT_CACHE=false). Install it when
+        // either is on - the class checks each flag itself, so disabling one
+        // never silently disables the other.
+        $stringBindings = filter_var(config('octane.mysql_string_bindings', true), FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) ?? true;
+        $statementCache = filter_var(config('octane.mysql_statement_cache', true), FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) ?? true;
+
+        if ($stringBindings || $statementCache) {
+            \Illuminate\Database\Connection::resolverFor('mysql', function ($connection, $database, $prefix, $config) {
+                return new \Laravel\Octane\Swoole\Database\MySqlStringBindingConnection($connection, $database, $prefix, $config);
+            });
+        }
+
         $this->bindCoroutineRedisManager();
 
         $this->app->bind(RoadRunnerServerProcessInspector::class, function ($app) {

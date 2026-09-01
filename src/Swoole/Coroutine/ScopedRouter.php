@@ -98,7 +98,6 @@ class ScopedRouter extends Router
         }
 
         $instanceProperty = $reflection->getProperty($property);
-        $instanceProperty->setAccessible(true);
 
         return $instanceProperty->getValue($object);
     }

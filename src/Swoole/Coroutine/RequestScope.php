@@ -3,8 +3,10 @@
 namespace Laravel\Octane\Swoole\Coroutine;
 
 use Closure;
+use Illuminate\Auth\AuthManager;
 use Illuminate\Contracts\Events\Dispatcher as EventDispatcher;
 use Illuminate\Cache\CacheManager;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Filesystem\FilesystemManager;
 use Illuminate\Foundation\Application;
 use Illuminate\Http\Request;
@@ -292,7 +294,9 @@ class RequestScope
             \Illuminate\Cache\RateLimiter::class => $this->createRateLimiter($sandbox),
             'config' => $this->cloneConfig(),
             'cookie' => $this->createCookieJar(),
+            'db.transactions' => new DatabaseTransactionsManager,
             DeferredCallbackCollection::class => new DeferredCallbackCollection,
+            'gate', \Illuminate\Contracts\Auth\Access\Gate::class, \Illuminate\Auth\Access\Gate::class => $this->createGate($sandbox),
             'filesystem', FilesystemManager::class, \Illuminate\Contracts\Filesystem\Factory::class => $this->createFilesystemManager($sandbox),
             'filesystem.disk', \Illuminate\Contracts\Filesystem\Filesystem::class => $this->createFilesystemDisk($sandbox),
             'filesystem.cloud', \Illuminate\Contracts\Filesystem\Cloud::class => $this->createFilesystemCloud($sandbox),
@@ -932,6 +936,22 @@ class RequestScope
                 continue;
             }
 
+            // Only rebind creators the AuthManager itself closed over.
+            // Auth::viaRequest() builds its closure inside AuthManager, so $this
+            // is the manager and rebinding is exactly what makes the
+            // coroutine-local request visible to the guard.
+            //
+            // A creator registered by a service provider is a different animal:
+            // Sanctum's guard extension calls $this->createGuard(), where $this
+            // is the SanctumServiceProvider. Rebinding it to the AuthManager
+            // routes that call through AuthManager::__call, which forwards to
+            // the default guard and throws "Method
+            // Lab404\Impersonate\Guard\SessionGuard::createGuard does not
+            // exist" on every sanctum-authenticated request.
+            if (! $reflection->getClosureThis() instanceof AuthManager) {
+                continue;
+            }
+
             $bound = $creator->bindTo($auth, $auth::class);
             if ($bound instanceof Closure) {
                 $customCreators[$driver] = $bound;
@@ -1425,6 +1445,45 @@ class RequestScope
      * @param  \Illuminate\Foundation\Application  $sandbox
      * @return \Illuminate\Routing\Redirector
      */
+    /**
+     * Create the coroutine-local authorization gate.
+     *
+     * Laravel registers the Gate as a singleton whose user resolver closes over
+     * the application instance that built it — the base worker app, which never
+     * has an authenticated user. Stock Octane papers over this by cloning the
+     * application per request and re-pointing the Gate at the clone
+     * (GiveNewApplicationInstanceToAuthorizationGate). Coroutine mode does not
+     * clone the app, so without this the Gate keeps resolving null and every
+     * policy check fails closed: $this->authorize() throws
+     * AuthorizationException and the request 403s even though the user is
+     * authenticated and owns the record.
+     *
+     * Cloning preserves registered abilities, policies and before/after
+     * callbacks; only the container and the user resolver are re-pointed at the
+     * coroutine's own auth.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createGate(Application $sandbox)
+    {
+        $base = $this->app->make(\Illuminate\Contracts\Auth\Access\Gate::class);
+
+        $gate = clone $base;
+
+        if (method_exists($gate, 'setContainer')) {
+            $gate->setContainer($sandbox);
+        }
+
+        $this->setObjectProperty($gate, 'userResolver', static function () use ($sandbox) {
+            $auth = $sandbox->make('auth');
+
+            return $auth ? $auth->user() : null;
+        });
+
+        return $gate;
+    }
+
     protected function createRedirector(Application $sandbox): \Illuminate\Routing\Redirector
     {
         $redirector = new \Illuminate\Routing\Redirector($sandbox->make('url'));
@@ -1531,7 +1590,6 @@ class RequestScope
             }
 
             $instanceProperty = $reflection->getProperty($property);
-            $instanceProperty->setAccessible(true);
             $instanceProperty->setValue($object, $value);
         } catch (ReflectionException) {
             // If the implementation changes upstream, fall back gracefully.
@@ -1559,7 +1617,6 @@ class RequestScope
             }
 
             $instanceProperty = $reflection->getProperty($property);
-            $instanceProperty->setAccessible(true);
 
             return $instanceProperty->getValue($object);
         } catch (ReflectionException) {
@@ -1589,7 +1646,6 @@ class RequestScope
             }
 
             $instanceMethod = $reflection->getMethod($method);
-            $instanceMethod->setAccessible(true);
 
             return $instanceMethod->invokeArgs($object, $parameters);
         } catch (ReflectionException) {

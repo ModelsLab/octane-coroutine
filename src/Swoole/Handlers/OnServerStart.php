@@ -17,7 +17,8 @@ class OnServerStart
         protected $timerTable,
         protected bool $shouldTick = true,
         protected bool $shouldSetProcessName = true,
-        protected int|string|null $timeoutFallbackSignal = SIGTERM
+        protected int|string|null $timeoutFallbackSignal = SIGTERM,
+        protected int $timeoutSweepIntervalMs = 5000
     ) {
         $this->timeoutFallbackSignal = EnsureRequestsDontExceedMaxExecutionTime::normalizeFallbackSignal($this->timeoutFallbackSignal);
     }
@@ -59,11 +60,18 @@ class OnServerStart
         }
 
         if ($this->maxExecutionTime > 0) {
-            Timer::tick(1000, function () use ($server) {
+            // One line per boot so production can never silently run without
+            // request-timeout enforcement again - chasing the 210s stalls
+            // burned hours on exactly the question this answers.
+            error_log("⏱️ Timeout sweep armed: max_execution_time={$this->maxExecutionTime}s, interval={$this->timeoutSweepIntervalMs}ms");
+
+            Timer::tick($this->timeoutSweepIntervalMs, function () use ($server) {
                 (new EnsureRequestsDontExceedMaxExecutionTime(
                     $this->extension, $this->timerTable, $this->maxExecutionTime, $server, $this->timeoutFallbackSignal
                 ))();
             });
+        } else {
+            error_log('⚠️ Timeout sweep DISABLED: max_execution_time resolved to 0 - requests can run unbounded');
         }
     }
 }

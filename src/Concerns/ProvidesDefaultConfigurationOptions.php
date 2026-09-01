@@ -124,6 +124,11 @@ trait ProvidesDefaultConfigurationOptions
             'cookie',
             'db',
             'db.factory',
+
+            // Warms the root instance, which only serves the non-coroutine
+            // path. In coroutine mode RequestScope hands each coroutine its
+            // own manager, because a shared one would run one request's
+            // afterCommit callbacks when another request commits.
             'db.transactions',
             'encrypter',
             'files',

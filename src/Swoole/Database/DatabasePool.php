@@ -2,6 +2,7 @@
 
 namespace Laravel\Octane\Swoole\Database;
 
+use Closure;
 use Swoole\Coroutine\Channel;
 use Illuminate\Database\Connectors\ConnectionFactory;
 use Illuminate\Database\Connection;
@@ -13,6 +14,13 @@ use Throwable;
  */
 class DatabasePool
 {
+    /**
+     * Default number of seconds a pooled connection lives before it is
+     * recycled. Recycling frees any server-side prepared statements the
+     * connection has leaked (see release()).
+     */
+    public const DEFAULT_MAX_LIFETIME = 300.0;
+
     protected Channel $channel;
     protected int $currentConnections = 0;
     protected array $config;
@@ -20,14 +28,45 @@ class DatabasePool
     protected ConnectionFactory $factory;
     protected array $connectionConfig;
     protected array $idleSince = [];
+    protected array $createdAt = [];
+    protected array $borrowedSince = [];
+
+    /**
+     * Weak references to every connection this pool created and has not
+     * closed. A borrower that drops its connection without release() (a
+     * child coroutine ending, app code deleting the context entry) leaves
+     * the counter incremented for a connection that no longer exists;
+     * reconcileVanishedConnections() detects the dead reference and heals
+     * the slot instead of letting the pool drift toward false exhaustion.
+     *
+     * @var array<int, \WeakReference<object>>
+     */
+    protected array $liveConnections = [];
+
     protected ?int $idlePruneTimerId = null;
 
-    public function __construct(array $config, array $connectionConfig, string $name, ConnectionFactory $factory)
-    {
+    /**
+     * Wires a borrowed connection to the current request's container services.
+     *
+     * Pooled connections outlive the request that created them, so this runs
+     * on every checkout rather than once at creation.
+     *
+     * @var \Closure(\Illuminate\Database\Connection): void|null
+     */
+    protected ?Closure $configurator;
+
+    public function __construct(
+        array $config,
+        array $connectionConfig,
+        string $name,
+        ConnectionFactory $factory,
+        ?Closure $configurator = null
+    ) {
         $this->config = $config;
         $this->name = $name;
         $this->factory = $factory;
         $this->connectionConfig = $connectionConfig;
+        $this->configurator = $configurator;
 
         // Create a channel for pooling connections
         // Channel size = max_connections
@@ -59,12 +98,20 @@ class DatabasePool
         $waitTimeout = $this->config['wait_timeout'] ?? 3.0;
         $maxConnections = $this->config['max_connections'] ?? 10;
 
-        // Fast path: try a non-blocking pop first to avoid unnecessary waits.
-        $connection = $this->channel->pop(0.001);
+        // Fast path: only pop when something is pooled - popping an empty
+        // channel costs a 1ms scheduler wait before checkout can create.
+        $connection = $this->channel->length() > 0 ? $this->channel->pop(0.001) : false;
 
         if ($connection === false) {
             // If we can grow the pool, create immediately instead of waiting.
             if ($this->currentConnections < $maxConnections) {
+                $connection = $this->createConnection();
+            } elseif ($this->reconcileVanishedConnections() > 0
+                && $this->currentConnections < $maxConnections) {
+                // The throttled prune no longer reconciles on every checkout,
+                // so a borrower that died without releasing could otherwise
+                // pin the counter at max for up to prune_interval - turning
+                // healable slots into 3s waits and pool-exhausted 500s.
                 $connection = $this->createConnection();
             } else {
                 // Pool is at max; wait for a connection to be released.
@@ -76,18 +123,34 @@ class DatabasePool
             }
         }
 
+        $idleFor = $this->idleSeconds($connection);
+
         $this->markBorrowed($connection);
 
-        // Check if connection is still valid
-        if (! $this->checkConnection($connection)) {
-            $connection = $this->reconnect($connection);
+        // Ping only connections that sat idle long enough for the server to
+        // have plausibly dropped them. Every pooled connection was released
+        // moments-to-seconds ago on a busy pool, and the ping is a full
+        // round-trip to the database (measured ~10-20ms from Cloud Run to the
+        // DB host) paid on every request. Connections created on demand have
+        // no idle timestamp yet and skip the ping. A connection that died while
+        // idle still gets caught: the first real query fails and the
+        // reconnector swaps in a fresh PDO.
+        if ($idleFor !== null && $idleFor >= $this->pingAfterIdleSeconds()) {
+            if (! $this->checkConnection($connection)) {
+                $connection = $this->reconnect($connection);
+            }
         }
 
-        // Defensive cleanup on checkout as well as release. If a previous
-        // request left PDO or Laravel transaction state dirty, never hand that
-        // connection to the next coroutine.
+        // release() fully resets every connection before re-pooling it and
+        // closes any connection whose reset fails, so pooled connections are
+        // clean by invariant and the checkout-side session SQL (two more
+        // round-trips per borrow) is redundant. The local transaction checks
+        // below cost no SQL; only a genuinely dirty connection - e.g. handed
+        // to us dirty by the factory - pays for a full reset.
         try {
-            $this->resetConnection($connection);
+            if ($this->hasDirtyTransactionState($connection)) {
+                $this->resetConnection($connection);
+            }
         } catch (Throwable $e) {
             error_log('❌ Dirty DB connection could not be reset on checkout: '.$e->getMessage());
             $this->closeConnection($connection);
@@ -95,7 +158,37 @@ class DatabasePool
             $connection = $this->createConnection();
         }
 
+        // Illuminate's DatabaseManager::configure() normally attaches the event
+        // dispatcher and the transactions manager. The pool bypasses that, so
+        // without this the connection has no dispatcher (DB::listen never
+        // fires) and afterCommit() throws.
+        try {
+            $this->configureForCurrentRequest($connection);
+        } catch (Throwable $e) {
+            // Handing out an unwired connection would silently reintroduce the
+            // very bug this guards against, so surface it instead. Return the
+            // connection to the pool's accounting first so a failing container
+            // does not also leak the slot.
+            $this->markBorrowed($connection);
+            $this->closeConnection($connection);
+            $this->currentConnections--;
+
+            throw $e;
+        }
+
         return $connection;
+    }
+
+    /**
+     * Wire a borrowed connection to the current request's container services.
+     */
+    protected function configureForCurrentRequest($connection): void
+    {
+        if ($this->configurator === null || ! $connection instanceof Connection) {
+            return;
+        }
+
+        ($this->configurator)($connection);
     }
 
     /**
@@ -104,6 +197,24 @@ class DatabasePool
     public function release($connection): void
     {
         if (! $connection) {
+            return;
+        }
+
+        // Recycle connections past max_lifetime instead of re-pooling them.
+        // PDO statements destroyed while a connection is busy in another
+        // coroutine leak server-side (mysqlnd skips COM_STMT_CLOSE on a busy
+        // connection and never retries), so any long-lived pooled connection
+        // accumulates leaked prepared statements. Closing it frees them all.
+        // Transactions are rolled back explicitly first: disconnect() only
+        // drops the Connection's PDO reference, and a leaked statement can
+        // keep the PDO (and its row locks) alive until a future gc run.
+        if ($this->hasOutlivedMaxLifetime($connection)) {
+            $this->markBorrowed($connection);
+            $this->rollBackAbandonedTransactions($connection);
+            $this->closeConnection($connection);
+            $this->currentConnections--;
+            $this->pruneIdleConnections();
+
             return;
         }
 
@@ -136,14 +247,37 @@ class DatabasePool
      */
     public function pruneIdleConnections(?float $now = null): int
     {
-        $maxIdleTime = (float) ($this->config['max_idle_time'] ?? 60.0);
+        // get() and release() both prune opportunistically, so a busy pool
+        // would otherwise pay the full drain-and-refill walk several times
+        // per request. Worse, while the drain holds idle connections in a
+        // local array, a concurrent checkout that yields into an empty
+        // channel creates a brand-new connection it never needed. Once a
+        // second is plenty; the heartbeat timer stays the primary pruner.
+        $interval = (float) ($this->config['prune_interval'] ?? 1.0);
+        $clock = $now ?? microtime(true);
 
-        if ($maxIdleTime <= 0 || $this->currentConnections <= ($this->config['min_connections'] ?? 1)) {
+        if ($interval > 0 && ($clock - $this->lastPruneAt) < $interval) {
+            return 0;
+        }
+
+        $this->lastPruneAt = $clock;
+
+        $this->reconcileVanishedConnections();
+
+        $maxIdleTime = (float) ($this->config['max_idle_time'] ?? 60.0);
+        $minConnections = (int) ($this->config['min_connections'] ?? 1);
+
+        // Idle pruning respects min_connections; lifetime pruning does not,
+        // since an over-age connection carries leaked server-side prepared
+        // statements that only closing it can free. The pool refills on demand.
+        $idlePruningActive = $maxIdleTime > 0 && $this->currentConnections > $minConnections;
+        $lifetimePruningActive = ((float) ($this->config['max_lifetime'] ?? self::DEFAULT_MAX_LIFETIME)) > 0;
+
+        if (! $idlePruningActive && ! $lifetimePruningActive) {
             return 0;
         }
 
         $now ??= microtime(true);
-        $minConnections = (int) ($this->config['min_connections'] ?? 1);
         $available = $this->channel->length();
         $kept = [];
         $closed = 0;
@@ -159,7 +293,11 @@ class DatabasePool
             $idleSince = $this->idleSince[$connectionId] ?? $now;
             $idleFor = $now - $idleSince;
 
-            if ($this->currentConnections > $minConnections && $idleFor >= $maxIdleTime) {
+            $idleExpired = $maxIdleTime > 0
+                && $this->currentConnections > $minConnections
+                && $idleFor >= $maxIdleTime;
+
+            if ($idleExpired || $this->hasOutlivedMaxLifetime($connection, $now)) {
                 unset($this->idleSince[$connectionId]);
                 $this->closeConnection($connection);
                 $this->currentConnections--;
@@ -172,7 +310,13 @@ class DatabasePool
         }
 
         foreach ($kept as $connection) {
-            $this->channel->push($connection, 0.001);
+            if (! $this->channel->push($connection, 0.001)) {
+                error_log('⚠️ Could not re-pool a kept connection - closing it instead');
+                $this->markBorrowed($connection);
+                $this->closeConnection($connection);
+                $this->currentConnections--;
+                $closed++;
+            }
         }
 
         return $closed;
@@ -215,18 +359,17 @@ class DatabasePool
                     $connection->setReadWriteType(null);
                 }
 
-                // Reset session variables for MySQL
+                // No session SQL for MySQL here: nothing in a request can
+                // change the isolation level, and the autocommit variable
+                // never changes either - PDO::beginTransaction runs START
+                // TRANSACTION, which suspends autocommit for that transaction
+                // without touching the session variable. normalizeSession()
+                // covers the two moments a session actually IS new - creation
+                // and the reconnector's PDO swap. Re-SETting on every release
+                // was measured at 45 statement-pairs/s in production, each
+                // pair holding the connection out of the pool for two round
+                // trips.
                 $driver = $connection->getDriverName();
-                if (in_array($driver, ['mysql', 'mariadb'])) {
-                    try {
-                        // Reset session state
-                        $pdo->exec('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
-                        $pdo->exec('SET autocommit = 1');
-                    } catch (Throwable $e) {
-                        // Non-critical, log and continue
-                        error_log('⚠️ Could not reset MySQL session: '.$e->getMessage());
-                    }
-                }
 
                 // For PostgreSQL
                 if ($driver === 'pgsql') {
@@ -236,6 +379,12 @@ class DatabasePool
                         error_log('⚠️ Could not reset PostgreSQL session: '.$e->getMessage());
                     }
                 }
+
+                // Drop the finishing request's transactions manager. It is
+                // scoped to that coroutine, and holding it here would let its
+                // pending afterCommit callbacks fire for the next borrower.
+                // The next checkout attaches the manager it belongs to.
+                $connection->unsetTransactionManager();
             }
         } catch (Throwable $e) {
             error_log('❌ Error resetting connection state: '.$e->getMessage());
@@ -245,10 +394,63 @@ class DatabasePool
     }
 
     /**
-     * Safely close a connection
+     * Start tracking a freshly created connection.
+     *
+     * PHP reuses object ids. If the previous occupant of this id is a
+     * tracked connection that died while factory->make() was connecting
+     * (allocation-triggered gc can run inside make, and the freed slot is
+     * handed to the next allocation), overwriting its weak reference would
+     * strand that slot's counter increment forever. Heal it on overwrite.
+     */
+    protected function trackConnection(object $connection): void
+    {
+        $id = spl_object_id($connection);
+
+        if (isset($this->liveConnections[$id]) && $this->liveConnections[$id]->get() === null) {
+            unset($this->liveConnections[$id], $this->idleSince[$id], $this->borrowedSince[$id], $this->createdAt[$id]);
+            $this->currentConnections--;
+            error_log('⚠️ DB pool healed a connection slot dropped without release (object id reused)');
+        }
+
+        $this->createdAt[$id] = microtime(true);
+        $this->liveConnections[$id] = \WeakReference::create($connection);
+    }
+
+    /**
+     * Decrement the counter for connections that were garbage-collected
+     * without passing through release()/closeConnection().
+     */
+    public function reconcileVanishedConnections(): int
+    {
+        $healed = 0;
+
+        foreach ($this->liveConnections as $id => $ref) {
+            if ($ref->get() !== null) {
+                continue;
+            }
+
+            unset($this->liveConnections[$id], $this->idleSince[$id], $this->createdAt[$id], $this->borrowedSince[$id]);
+            $this->currentConnections--;
+            $healed++;
+        }
+
+        if ($healed > 0) {
+            error_log("⚠️ DB pool healed {$healed} connection slot(s) dropped without release");
+        }
+
+        return $healed;
+    }
+
+    /**
+     * Safely close a connection and drop its tracking state.
      */
     protected function closeConnection($connection): void
     {
+        if (is_object($connection)) {
+            $id = spl_object_id($connection);
+            unset($this->createdAt[$id], $this->liveConnections[$id], $this->borrowedSince[$id]);
+        }
+
         try {
             if ($connection instanceof Connection) {
                 $connection->disconnect();
@@ -259,14 +461,126 @@ class DatabasePool
     }
 
     /**
+     * Roll back any transaction left open on a connection about to be closed.
+     *
+     * @see release() for why closing alone is not enough.
+     */
+    protected function rollBackAbandonedTransactions($connection): void
+    {
+        if (! $connection instanceof Connection) {
+            return;
+        }
+
+        try {
+            if ($connection->transactionLevel() > 0) {
+                $connection->rollBack(0);
+            }
+
+            $pdo = $connection->getPdo();
+
+            if ($pdo && $pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            $connection->unsetTransactionManager();
+        } catch (Throwable $e) {
+            error_log('⚠️ Could not roll back before recycling expired connection: '.$e->getMessage());
+        }
+    }
+
+    /**
+     * Force a fresh connection into the same session state resetConnection()
+     * leaves recycled ones in. Checkout no longer re-runs the session SQL,
+     * so fresh and recycled connections must be indistinguishable: without
+     * this, a server whose global isolation level or autocommit differs from
+     * these values would hand out connections whose behavior depends on
+     * whether they happen to be fresh - nondeterministic snapshot and
+     * gap-lock semantics per request.
+     */
+    protected function normalizeSession(Connection $connection): void
+    {
+        if (! in_array($connection->getDriverName(), ['mysql', 'mariadb'], true)) {
+            return;
+        }
+
+        try {
+            $pdo = $connection->getPdo();
+
+            if ($connection->getDriverName() === 'mariadb') {
+                // MariaDB before 11.1.1 has no transaction_isolation system
+                // variable (MDEV-21921), so the combined assignment errors
+                // wholesale there. The standard-SQL form works everywhere,
+                // and this only runs when a session is created.
+                $pdo->exec('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+                $pdo->exec('SET autocommit = 1');
+            } else {
+                $pdo->exec("SET SESSION transaction_isolation = 'REPEATABLE-READ', SESSION autocommit = 1");
+            }
+        } catch (Throwable $e) {
+            error_log('⚠️ Could not normalize fresh MySQL session: '.$e->getMessage());
+        }
+    }
+
+    /**
+     * Whether a connection is older than the pool's max_lifetime.
+     *
+     * A value of 0 or less disables lifetime recycling. Connections without a
+     * recorded creation time are treated as brand new.
+     */
+    protected function hasOutlivedMaxLifetime($connection, ?float $now = null): bool
+    {
+        $maxLifetime = (float) ($this->config['max_lifetime'] ?? self::DEFAULT_MAX_LIFETIME);
+
+        if ($maxLifetime <= 0 || ! is_object($connection)) {
+            return false;
+        }
+
+        $now ??= microtime(true);
+        $createdAt = $this->createdAt[spl_object_id($connection)] ?? $now;
+
+        return ($now - $createdAt) >= $maxLifetime;
+    }
+
+    /**
      * Create a new database connection
      */
     protected function createConnection()
     {
+        $this->reconcileVanishedConnections();
+
         $this->currentConnections++;
 
         try {
-            return $this->factory->make($this->connectionConfig, $this->name);
+            $connection = $this->factory->make($this->connectionConfig, $this->name);
+
+            if (is_object($connection)) {
+                $this->trackConnection($connection);
+            }
+
+            if ($connection instanceof Connection) {
+                $this->normalizeSession($connection);
+
+                // Without a reconnector, Connection::reconnect() throws
+                // LostConnectionException and the pool silently discards and
+                // rebuilds the connection on every stale checkout. Swapping the
+                // PDO in place keeps the object identity the pool holds.
+                $connection->setReconnector(function (Connection $connection): void {
+                    $fresh = $this->factory->make($this->connectionConfig, $this->name);
+
+                    $connection->setPdo($fresh->getRawPdo())
+                        ->setReadPdo($fresh->getRawReadPdo());
+
+                    // The server session is brand new: normalize it exactly
+                    // like a created connection, and restart the max_lifetime
+                    // clock along with it. Release no longer re-SETs session
+                    // state, so this is the only thing keeping a reconnected
+                    // session at the pool's isolation level.
+                    $this->normalizeSession($connection);
+                    $this->createdAt[spl_object_id($connection)] = microtime(true);
+                });
+            }
+
+            return $connection;
         } catch (Throwable $e) {
             $this->currentConnections--;
 
@@ -274,17 +588,65 @@ class DatabasePool
         }
     }
 
+    /**
+     * Seconds this connection has sat idle in the pool, or null when unknown
+     * (freshly created connections have no idle timestamp).
+     */
+    protected function idleSeconds($connection): ?float
+    {
+        if (! is_object($connection)) {
+            return null;
+        }
+
+        $since = $this->idleSince[spl_object_id($connection)] ?? null;
+
+        return $since === null ? null : microtime(true) - $since;
+    }
+
+    /**
+     * Idle age beyond which a checkout pings the server before handing the
+     * connection out. 0 or negative pings on every checkout of a pooled
+     * connection (freshly created ones never ping - they just connected).
+     */
+    protected function pingAfterIdleSeconds(): float
+    {
+        return (float) ($this->config['ping_after_idle'] ?? 30.0);
+    }
+
+    /**
+     * Local-only dirty check: no SQL, just the Laravel counter and the PDO
+     * driver flag.
+     */
+    protected function hasDirtyTransactionState($connection): bool
+    {
+        if (! $connection instanceof Connection) {
+            return false;
+        }
+
+        if ($connection->transactionLevel() > 0) {
+            return true;
+        }
+
+        $pdo = $connection->getRawPdo();
+
+        return $pdo instanceof \PDO && $pdo->inTransaction();
+    }
+
     protected function markIdle($connection): void
     {
         if (is_object($connection)) {
-            $this->idleSince[spl_object_id($connection)] = microtime(true);
+            $id = spl_object_id($connection);
+            $this->idleSince[$id] = microtime(true);
+            unset($this->borrowedSince[$id]);
         }
     }
 
     protected function markBorrowed($connection): void
     {
         if (is_object($connection)) {
-            unset($this->idleSince[spl_object_id($connection)]);
+            $id = spl_object_id($connection);
+            unset($this->idleSince[$id]);
+            $this->borrowedSince[$id] = microtime(true);
         }
     }
 
@@ -344,6 +706,10 @@ class DatabasePool
      */
     public function getStats(): array
     {
+        // Heal first so a quiet pool does not report vanished borrowers as
+        // live or long-borrowed connections.
+        $this->reconcileVanishedConnections();
+
         return [
             'current_connections' => $this->currentConnections,
             'available_connections' => $this->channel->length(),
@@ -351,8 +717,39 @@ class DatabasePool
             'max_connections' => $this->config['max_connections'] ?? 10,
             'min_connections' => $this->config['min_connections'] ?? 1,
             'max_idle_time' => $this->config['max_idle_time'] ?? 60.0,
+            'max_lifetime' => $this->config['max_lifetime'] ?? self::DEFAULT_MAX_LIFETIME,
+            'tracked_connections' => count($this->liveConnections),
+            'long_borrowed_connections' => $this->longBorrowedCount(),
         ];
     }
+
+    /**
+     * Connections held by a borrower for longer than max_lifetime. The pool
+     * cannot recycle these (recycling happens at release), so a non-zero
+     * value points at a coroutine or daemon that never releases — the
+     * borrower should end its coroutine or call
+     * DatabaseManager::releaseConnections() periodically.
+     */
+    protected function longBorrowedCount(?float $now = null): int
+    {
+        $maxLifetime = (float) ($this->config['max_lifetime'] ?? self::DEFAULT_MAX_LIFETIME);
+
+        if ($maxLifetime <= 0) {
+            return 0;
+        }
+
+        $now ??= microtime(true);
+
+        return count(array_filter(
+            $this->borrowedSince,
+            static fn (float $since): bool => ($now - $since) >= $maxLifetime
+        ));
+    }
+
+    /**
+     * When the last full prune pass ran, for the opportunistic-prune throttle.
+     */
+    protected float $lastPruneAt = 0.0;
 
     protected function startIdlePruner(): void
     {

@@ -22,7 +22,6 @@ class FacadeCache
         }
 
         $property = $reflection->getProperty('cached');
-        $property->setAccessible(true);
         $property->setValue(null, false);
 
         static::$disabled = true;

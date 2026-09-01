@@ -27,6 +27,37 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | MySQL Integer Bindings as Strings
+    |--------------------------------------------------------------------------
+    |
+    | MySQL 9.0.x re-prepares statements on every execute that carries an
+    | integer-typed parameter (mysqlnd silently retries: two extra round
+    | trips per int-bound query). Binding integers as strings avoids it with
+    | identical plans and results.
+    |
+    */
+
+    'mysql_string_bindings' => env('OCTANE_MYSQL_STRING_BINDINGS', true),
+
+    /*
+    |--------------------------------------------------------------------------
+    | MySQL Prepared-Statement Cache
+    |--------------------------------------------------------------------------
+    |
+    | Reuse prepared statements per pooled connection (LRU, keyed by SQL).
+    | Saves one COM_STMT_PREPARE round trip plus parse work on every
+    | repeated query. Flushed automatically when the underlying PDO is
+    | swapped. Watch Prepared_stmt_count server-side when raising the size.
+    |
+    */
+
+    'mysql_statement_cache' => env('OCTANE_MYSQL_STMT_CACHE', true),
+
+    'mysql_statement_cache_size' => env('OCTANE_MYSQL_STMT_CACHE_SIZE', 64),
+
+
+    /*
+    |--------------------------------------------------------------------------
     | Octane Server
     |--------------------------------------------------------------------------
     |
@@ -186,6 +217,20 @@ return [
     'swoole' => [
         /*
         |--------------------------------------------------------------------------
+        | Request Timeout Sweep Interval
+        |--------------------------------------------------------------------------
+        |
+        | How often (ms) the server scans in-flight requests for ones that
+        | exceeded max_execution_time. Coarser is cheaper: a request can
+        | overrun its budget by at most one interval. Clamped to >= 1000.
+        |
+        */
+
+        'timeout_sweep_interval_ms' => env('OCTANE_TIMEOUT_SWEEP_INTERVAL_MS', 5000),
+
+
+        /*
+        |--------------------------------------------------------------------------
         | Database Connection Safety Buffer
         |--------------------------------------------------------------------------
         |
@@ -317,6 +362,6 @@ return [
     |
     */
 
-    'max_execution_time' => 30,
+    'max_execution_time' => env('OCTANE_MAX_EXECUTION_TIME', 30),
 
 ];
