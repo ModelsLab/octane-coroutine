@@ -76,15 +76,22 @@ class RequestScopeQueueIsolationTest extends TestCase
         $defaultConnection = $scope->resolve('queue.connection', $sandbox);
         $sync = $scopedQueue->connection('sync');
         $null = $scopedQueue->connection('null');
-        $failover = $scopedQueue->connection('failover');
 
         $this->assertInstanceOf(RedisQueue::class, $defaultConnection);
         $this->assertSame($scopedQueue->connection('redis'), $defaultConnection);
         $this->assertInstanceOf(SyncQueue::class, $sync);
         $this->assertInstanceOf(NullQueue::class, $null);
-        $this->assertInstanceOf(FailoverQueue::class, $failover);
         $this->assertSame($sandbox, $sync->getContainer());
         $this->assertSame($sandbox, $null->getContainer());
+
+        // The failover driver was introduced in Laravel 12.
+        if (! class_exists(FailoverQueue::class)) {
+            return;
+        }
+
+        $failover = $scopedQueue->connection('failover');
+
+        $this->assertInstanceOf(FailoverQueue::class, $failover);
         $this->assertSame($sandbox, $failover->getContainer());
         $this->assertSame($scopedQueue, $failover->manager);
         $this->assertSame(['null', 'sync'], $failover->connections);
