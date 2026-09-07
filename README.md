@@ -53,6 +53,12 @@ With the same 1-second blocking operations, this achieves **2,773+ requests/seco
 
 ## 📦 Installation
 
+### Requirements
+
+- PHP 8.1+ (PHP 8.3+ when running Laravel 13)
+- Laravel 10, 11, 12 or 13
+- The `swoole` PHP extension
+
 Install via Composer from [Packagist](https://packagist.org/packages/modelslab/octane-coroutine):
 
 ```bash

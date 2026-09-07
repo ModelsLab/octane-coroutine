@@ -134,6 +134,10 @@ class DatabasePoolConnectionConfigurationTest extends TestCase
     {
         $this->skipIfUnsupported();
 
+        if (! method_exists(\Illuminate\Database\Connection::class, 'afterRollBack')) {
+            $this->markTestSkipped('afterRollBack() requires Laravel 12.');
+        }
+
         $base = $this->baseApplication();
         $manager = $this->databaseManager($base);
 

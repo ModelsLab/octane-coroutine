@@ -108,13 +108,16 @@ class MySqlStringBindingConnection extends MySqlConnection
     /**
      * {@inheritdoc}
      */
-    public function select($query, $bindings = [], $useReadPdo = true)
+    public function select($query, $bindings = [], $useReadPdo = true, array $fetchUsing = [])
     {
         if (! $this->statementCacheIsEnabled()) {
-            return parent::select($query, $bindings, $useReadPdo);
+            // Laravel 13 added $fetchUsing; earlier versions reject a fourth argument.
+            return $fetchUsing === []
+                ? parent::select($query, $bindings, $useReadPdo)
+                : parent::select($query, $bindings, $useReadPdo, $fetchUsing);
         }
 
-        return $this->run($query, $bindings, function ($query, $bindings) use ($useReadPdo) {
+        return $this->run($query, $bindings, function ($query, $bindings) use ($useReadPdo, $fetchUsing) {
             if ($this->pretending()) {
                 return [];
             }
@@ -127,7 +130,7 @@ class MySqlStringBindingConnection extends MySqlConnection
             try {
                 $this->executeCached($statement, $pdo, $query, $bindings);
 
-                return $statement->fetchAll();
+                return $statement->fetchAll(...$fetchUsing);
             } finally {
                 // Always drain: a cached statement no longer frees its result
                 // in a destructor, and on the unbuffered connections two of

@@ -13,6 +13,15 @@ use Swoole\Coroutine\Channel;
 
 class RequestScopeDeferredCallbackIsolationTest extends TestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        if (! class_exists(DeferredCallbackCollection::class)) {
+            $this->markTestSkipped('Deferred callbacks require Laravel 11.');
+        }
+    }
+
     public function test_deferred_callback_collection_is_request_scoped(): void
     {
         $base = new Application(__DIR__);

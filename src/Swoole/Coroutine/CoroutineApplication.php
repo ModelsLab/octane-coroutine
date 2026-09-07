@@ -1724,9 +1724,15 @@ class CoroutineApplication extends Application
         return $this->getCurrentApp()->resolveEnvironmentUsing($callback);
     }
 
-    public function resolveFromAttribute(\ReflectionAttribute $attribute)
+    public function resolveFromAttribute(\ReflectionAttribute $attribute, ?\ReflectionParameter $parameter = null)
     {
-        return $this->getCurrentApp()->resolveFromAttribute($attribute);
+        $app = $this->getCurrentApp();
+
+        // Laravel 13 passes the resolving parameter to contextual attribute
+        // handlers, while Laravel 11 and 12 only pass the attribute itself.
+        return $parameter === null
+            ? $app->resolveFromAttribute($attribute)
+            : $app->resolveFromAttribute($attribute, $parameter);
     }
 
     public function runningConsoleCommand(...$commands)
