@@ -57,6 +57,7 @@ class OnWorkerStart
         $this->workerState->server = $server;
         $this->workerState->workerId = $workerId;
         $this->workerState->workerPid = posix_getpid();
+        $this->configureCooperativeMaxRequests($server, $workerId);
         $this->workerState->worker = $this->bootWorker($server, $workerId);
 
         $this->dispatchServerTickTaskEverySecond($server);
@@ -72,6 +73,27 @@ class OnWorkerStart
         }
         
         error_log("✅ {$workerType} #{$workerId} (PID: {$this->workerState->workerPid}) initialized and ready!");
+    }
+
+    protected function configureCooperativeMaxRequests($server, int $workerId): void
+    {
+        $workerNum = $server->setting['worker_num'] ?? 1;
+
+        if ($workerId >= $workerNum) {
+            return;
+        }
+
+        $maxRequests = max(0, (int) ($this->serverState['maxRequests'] ?? 0));
+        $maxRequestGrace = max(0, (int) ($this->serverState['maxRequestGrace'] ?? 0));
+
+        if ($maxRequests > 0 && $maxRequestGrace > 0) {
+            $maxRequests += random_int(0, $maxRequestGrace);
+        }
+
+        $this->workerState->handledRequests = 0;
+        $this->workerState->maxRequests = $maxRequests;
+        $this->workerState->recycleRequested = false;
+        $this->workerState->recycleTriggered = false;
     }
 
     /**

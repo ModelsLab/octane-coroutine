@@ -64,6 +64,9 @@
         "spiral/roadrunner-http": "<3.3.0"
     },
     "autoload": {
+        "classmap": [
+            "bin/WorkerState.php"
+        ],
         "psr-4": {
             "Laravel\\Octane\\": "src"
         }

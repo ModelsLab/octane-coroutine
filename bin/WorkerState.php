@@ -29,4 +29,12 @@ class WorkerState
     public $lastRequestTime;
 
     public $ready = false;
+
+    public int $handledRequests = 0;
+
+    public int $maxRequests = 0;
+
+    public bool $recycleRequested = false;
+
+    public bool $recycleTriggered = false;
 }
