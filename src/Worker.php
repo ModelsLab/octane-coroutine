@@ -144,6 +144,7 @@ class Worker implements WorkerContract
             // paths below the connections are still released, just without
             // the garbage-first ordering — a bounded, logged degradation.)
             $pooledConnections = [];
+            $redisConnections = [];
             $dbManager = null;
 
             try {
@@ -160,7 +161,12 @@ class Worker implements WorkerContract
                         $sandbox->make(LivewireCoroutineMutex::class)->releaseAllForCurrentCoroutine();
                     }
 
-                    $this->releaseCoroutineRedisConnections();
+                    // Detached before flush() (whose scope purge would close them) but
+                    // released only after the request is torn down, in the finally
+                    // block below, like the database connections: with the Redis pool
+                    // on, a socket returned earlier could be borrowed by another request
+                    // while this request's teardown still used it.
+                    $redisConnections = $this->detachCoroutineRedisConnections();
                 }
 
                 $sandbox->flush();
@@ -196,6 +202,7 @@ class Worker implements WorkerContract
                 }
             } finally {
                 $this->releaseDetachedDatabaseConnections($pooledConnections);
+                $this->releaseDetachedRedisConnections($redisConnections);
 
                 if ($inCoroutine) {
                     // A destructor run during teardown or gc above may have
@@ -225,24 +232,54 @@ class Worker implements WorkerContract
     }
 
     /**
-     * Close the Redis connections the worker-level manager opened for this coroutine.
+     * Take the Redis connections the worker-level manager opened for this coroutine
+     * out of its context, to be released once the request has been torn down.
      *
      * The manager keeps them in coroutine context so concurrent requests never
      * share a hooked phpredis socket. Without this they would only be dropped
      * when the context is cleared, leaving the sockets open in the meantime.
+     *
+     * @return array{0?: object, 1?: array}
      */
-    protected function releaseCoroutineRedisConnections(): void
+    protected function detachCoroutineRedisConnections(): array
     {
         try {
             if (! $this->app->resolved('redis')) {
-                return;
+                return [];
             }
 
             $redis = $this->app->make('redis');
 
+            if (method_exists($redis, 'detachConnections')) {
+                return [$redis, $redis->detachConnections()];
+            }
+
             if (method_exists($redis, 'releaseConnections')) {
                 $redis->releaseConnections();
             }
+        } catch (Throwable $e) {
+            error_log('⚠️ Failed to detach coroutine Redis connections: '.$e->getMessage());
+        }
+
+        return [];
+    }
+
+    /**
+     * Return the request's detached Redis connections to the pool, or close them.
+     *
+     * @param  array  $detached
+     * @return void
+     */
+    protected function releaseDetachedRedisConnections(array $detached): void
+    {
+        if ($detached === []) {
+            return;
+        }
+
+        [$redis, $connections] = $detached;
+
+        try {
+            $redis->releaseDetachedConnections($connections);
         } catch (Throwable $e) {
             error_log('⚠️ Failed to release coroutine Redis connections: '.$e->getMessage());
         }

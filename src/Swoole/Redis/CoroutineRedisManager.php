@@ -26,7 +26,9 @@ use Throwable;
  * manager coroutine-aware closes that hole for every such holder, because
  * RedisStore re-resolves the connection on each operation.
  *
- * Connections are released by the worker when the request coroutine finishes.
+ * Connections are released by the worker when the request coroutine finishes. With
+ * `octane.swoole.redis_pool.enabled`, clean phpredis connections go back to a per-worker
+ * pool (see RedisConnectionPool) instead of being closed.
  */
 class CoroutineRedisManager extends BaseRedisManager
 {
@@ -56,6 +58,20 @@ class CoroutineRedisManager extends BaseRedisManager
     protected $coroutineResolver = null;
 
     /**
+     * The worker's Redis connection pool, shared by every manager and clone in the process.
+     *
+     * @var \Laravel\Octane\Swoole\Redis\RedisConnectionPool|null
+     */
+    protected static ?RedisConnectionPool $pool = null;
+
+    /**
+     * Whether the pool configuration has been read in this process.
+     *
+     * @var bool
+     */
+    protected static bool $poolConfigured = false;
+
+    /**
      * Get a Redis connection by name.
      *
      * @param  \UnitEnum|string|null  $name
@@ -75,39 +91,63 @@ class CoroutineRedisManager extends BaseRedisManager
             return $connection;
         }
 
-        $connection = $this->configure(
-            $this->coroutineResolver()->resolve($name), $name
-        );
+        $poolKey = $this->pool() !== null ? $this->poolKey($name) : null;
+        $pool = $poolKey !== null ? $this->pool() : null;
+
+        $connection = $pool?->borrow($poolKey);
+
+        if ($connection === null) {
+            $connection = $this->coroutineResolver()->resolve($name);
+
+            if ($pool !== null && $connection instanceof PooledPhpRedisConnection) {
+                $pool->track($connection);
+            }
+        }
+
+        $connection = $this->configure($connection, $name);
 
         Context::set($key, $connection);
 
         $names = Context::get(self::CONTEXT_NAMES, []);
-        $names[$name] = true;
+        $names[$name] = $poolKey ?? true;
         Context::set(self::CONTEXT_NAMES, $names);
 
         return $connection;
     }
 
     /**
-     * Close and forget the connections opened by the current coroutine.
+     * Close (or return to the pool) and forget the connections opened by the current coroutine.
      *
      * @return int
      */
     public function releaseConnections(): int
     {
+        return $this->releaseDetachedConnections($this->detachConnections());
+    }
+
+    /**
+     * Take the current coroutine's connections out of its context without closing them.
+     *
+     * The worker detaches them before the coroutine context is cleared and releases them
+     * after the request has been torn down, so nothing from the request can still use a
+     * socket that another request has borrowed from the pool.
+     *
+     * @return list<array{0: \Illuminate\Redis\Connections\Connection, 1: string|true}>
+     */
+    public function detachConnections(): array
+    {
         if (! Context::inCoroutine()) {
-            return 0;
+            return [];
         }
 
-        $released = 0;
+        $detached = [];
 
-        foreach (array_keys(Context::get(self::CONTEXT_NAMES, [])) as $name) {
+        foreach (Context::get(self::CONTEXT_NAMES, []) as $name => $poolKey) {
             $key = self::CONTEXT_PREFIX.$name;
             $connection = Context::get($key);
 
             if ($connection instanceof Connection) {
-                $this->disconnectConnection($connection);
-                $released++;
+                $detached[] = [$connection, $poolKey];
             }
 
             Context::delete($key);
@@ -115,7 +155,31 @@ class CoroutineRedisManager extends BaseRedisManager
 
         Context::delete(self::CONTEXT_NAMES);
 
-        return $released;
+        return $detached;
+    }
+
+    /**
+     * Return detached connections to the pool, closing any the pool will not take.
+     *
+     * @param  list<array{0: \Illuminate\Redis\Connections\Connection, 1: string|true}>  $detached
+     * @return int
+     */
+    public function releaseDetachedConnections(array $detached): int
+    {
+        $pool = $this->pool();
+
+        foreach ($detached as [$connection, $poolKey]) {
+            $pooled = $pool !== null
+                && is_string($poolKey)
+                && $connection instanceof PooledPhpRedisConnection
+                && $pool->release($poolKey, $connection);
+
+            if (! $pooled) {
+                $this->disconnectConnection($connection);
+            }
+        }
+
+        return count($detached);
     }
 
     /**
@@ -185,9 +249,11 @@ class CoroutineRedisManager extends BaseRedisManager
     protected function coroutineResolver(): BaseRedisManager
     {
         if ($this->coroutineResolver === null) {
-            $resolver = new BaseRedisManager(
+            $resolver = new CoroutineRedisResolver(
                 $this->app, $this->driver, $this->coroutineSafeConfig()
             );
+
+            $resolver->pooled = $this->pool() !== null;
 
             foreach ($this->customCreators as $driver => $creator) {
                 $resolver->extend($driver, $creator);
@@ -197,6 +263,64 @@ class CoroutineRedisManager extends BaseRedisManager
         }
 
         return $this->coroutineResolver;
+    }
+
+    /**
+     * Get the worker's Redis pool, or null when pooling is disabled.
+     *
+     * @return \Laravel\Octane\Swoole\Redis\RedisConnectionPool|null
+     */
+    protected function pool(): ?RedisConnectionPool
+    {
+        if (! static::$poolConfigured) {
+            $config = [];
+
+            try {
+                $config = (array) $this->app->make('config')->get('octane.swoole.redis_pool', []);
+            } catch (Throwable) {
+                // No configuration: pooling stays off.
+            }
+
+            static::$pool = filter_var($config['enabled'] ?? false, FILTER_VALIDATE_BOOLEAN)
+                ? RedisConnectionPool::fromConfig($config)
+                : null;
+
+            static::$poolConfigured = true;
+        }
+
+        return static::$pool;
+    }
+
+    /**
+     * Forget the worker's Redis pool, closing its idle connections.
+     *
+     * @return void
+     */
+    public static function flushPool(): void
+    {
+        static::$pool?->flush();
+        static::$pool = null;
+        static::$poolConfigured = false;
+    }
+
+    /**
+     * Identify the connection settings a pooled connection was opened with.
+     *
+     * @param  string  $name
+     * @return string
+     */
+    protected function poolKey(string $name): ?string
+    {
+        try {
+            return $name.'|'.md5(serialize([
+                $this->driver,
+                $this->config[$name] ?? null,
+                $this->config['options'] ?? null,
+            ]));
+        } catch (Throwable) {
+            // A configuration that cannot be serialized (e.g. holding a closure) is not pooled.
+            return null;
+        }
     }
 
     /**
