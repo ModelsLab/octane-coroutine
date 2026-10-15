@@ -172,10 +172,13 @@ class SwooleClient implements Client, ServesStaticFiles
 
         $formatHeaders = config('octane.swoole.format_headers', true);
 
+        // Swoole keeps one value per header name: a second header() call for the
+        // same name replaces the first, so only the last of several Link, Vary or
+        // Cache-Control values used to reach the client. Send repeated values as
+        // one comma-separated field line instead (RFC 9110, section 5.3).
+        // Set-Cookie is the exception to that rule; it is sent below, one per cookie.
         foreach ($headers as $name => $values) {
-            foreach ($values as $value) {
-                $swooleResponse->header($name, $value, $formatHeaders);
-            }
+            $swooleResponse->header($name, implode(', ', $values), $formatHeaders);
         }
 
         if (! is_null($reason = $this->getReasonFromStatusCode($response->getStatusCode()))) {
