@@ -313,6 +313,7 @@ class RequestScope
             'translator', \Illuminate\Contracts\Translation\Translator::class, \Illuminate\Translation\Translator::class => $this->createTranslator($sandbox),
             \Illuminate\Session\Middleware\StartSession::class => $this->createStartSessionMiddleware($sandbox),
             'url' => $this->createUrlGenerator($sandbox),
+            \Illuminate\Foundation\Vite::class => $this->createVite(),
             'view', \Illuminate\Contracts\View\Factory::class => $this->createViewFactory($sandbox),
             \Illuminate\Routing\Contracts\CallableDispatcher::class => new \Illuminate\Routing\CallableDispatcher($sandbox),
             \Illuminate\Routing\Contracts\ControllerDispatcher::class => new \Illuminate\Routing\ControllerDispatcher($sandbox),
@@ -1391,6 +1392,31 @@ class RequestScope
     protected function createInertiaResponseFactory(): \Inertia\ResponseFactory
     {
         return new \Inertia\ResponseFactory;
+    }
+
+    /**
+     * Create an isolated Vite instance for the current coroutine.
+     *
+     * Vite records every asset @vite renders in its preloaded-assets list, and
+     * AddLinkHeadersForPreloadedAssets turns that list into the Link header. On
+     * the shared singleton, concurrent requests appended to one list and the
+     * FlushVite listener emptied it whenever another request started, so a page
+     * shipped another page's preload links or none. The clone keeps boot-time
+     * configuration (build directory, nonce, resolvers) with an empty list.
+     *
+     * Vite::flush() only exists from Laravel 12.10, so the list is reset directly.
+     *
+     * @return \Illuminate\Foundation\Vite
+     */
+    protected function createVite(): \Illuminate\Foundation\Vite
+    {
+        $vite = clone $this->app->make(\Illuminate\Foundation\Vite::class);
+
+        (function () {
+            $this->preloadedAssets = [];
+        })->call($vite);
+
+        return $vite;
     }
 
     /**
