@@ -53,6 +53,20 @@ class RequestScope
     private array $resolvedBindings = [];
 
     /**
+     * Rebinding callbacks registered for request-scoped abstracts.
+     *
+     * @var array<string, list<\Closure>>
+     */
+    private array $reboundCallbacks = [];
+
+    /**
+     * Callbacks to run when this request terminates.
+     *
+     * @var list<callable|string>
+     */
+    private array $terminatingCallbacks = [];
+
+    /**
      * The base application instance (shared, read-only reference).
      *
      * @var \Illuminate\Foundation\Application
@@ -134,6 +148,51 @@ class RequestScope
     public function forget(string $key): void
     {
         unset($this->bindings[$key], $this->bindingDefinitions[$key], $this->resolvedBindings[$key]);
+    }
+
+    /**
+     * Register a rebinding callback that lives as long as this request.
+     *
+     * @param  string  $key
+     * @param  \Closure  $callback
+     * @return void
+     */
+    public function addReboundCallback(string $key, Closure $callback): void
+    {
+        $this->reboundCallbacks[$key][] = $callback;
+    }
+
+    /**
+     * Register a callback to run when this request terminates.
+     *
+     * @param  callable|string  $callback
+     * @return void
+     */
+    public function addTerminatingCallback($callback): void
+    {
+        $this->terminatingCallbacks[] = $callback;
+    }
+
+    /**
+     * Get the request's terminating callback at the given position, if any.
+     *
+     * @param  int  $index
+     * @return callable|string|null
+     */
+    public function terminatingCallback(int $index)
+    {
+        return $this->terminatingCallbacks[$index] ?? null;
+    }
+
+    /**
+     * Get the request-local rebinding callbacks for the given abstract.
+     *
+     * @param  string  $key
+     * @return list<\Closure>
+     */
+    public function reboundCallbacks(string $key): array
+    {
+        return $this->reboundCallbacks[$key] ?? [];
     }
 
     /**
@@ -288,6 +347,7 @@ class RequestScope
 
         return match ($key) {
             'auth' => $this->createAuthManager($sandbox),
+            \Illuminate\Bus\Dispatcher::class => $this->createBusDispatcher($sandbox),
             'auth.driver' => $this->createAuthDriver($sandbox),
             'cache', \Illuminate\Contracts\Cache\Factory::class => $this->createCacheManager($sandbox),
             'cache.store', \Illuminate\Contracts\Cache\Repository::class => $this->createCacheStore($sandbox),
@@ -713,6 +773,8 @@ class RequestScope
         $this->bindings = [];
         $this->bindingDefinitions = [];
         $this->resolvedBindings = [];
+        $this->reboundCallbacks = [];
+        $this->terminatingCallbacks = [];
         $this->configCloned = false;
     }
 
@@ -1392,6 +1454,33 @@ class RequestScope
     protected function createInertiaResponseFactory(): \Inertia\ResponseFactory
     {
         return new \Inertia\ResponseFactory;
+    }
+
+    /**
+     * Create a bus dispatcher bound to the current request.
+     *
+     * dispatch(...)->afterResponse() and Bus::batch() register a terminating callback on
+     * the dispatcher's container. On the worker's singleton that is the base application,
+     * whose terminating list is never cleared and runs at the end of every request: each
+     * after-response job ran again at the end of every later request on the worker. A
+     * clone holding the request's container keeps the callback with this request. A fake
+     * (Bus::fake()) is not a Dispatcher and stays shared.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return \Illuminate\Bus\Dispatcher|null
+     */
+    protected function createBusDispatcher(Application $sandbox): ?\Illuminate\Bus\Dispatcher
+    {
+        $dispatcher = $this->app->make(\Illuminate\Bus\Dispatcher::class);
+
+        if (! $dispatcher instanceof \Illuminate\Bus\Dispatcher) {
+            return null;
+        }
+
+        $dispatcher = clone $dispatcher;
+        $this->setObjectProperty($dispatcher, 'container', $sandbox);
+
+        return $dispatcher;
     }
 
     /**

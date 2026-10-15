@@ -1272,20 +1272,51 @@ class CoroutineApplication extends Application
      * @param  callable|string  $callback
      * @return $this
      */
+    /**
+     * Register a terminating callback.
+     *
+     * A callback registered during a request belongs to that request. Forwarded to the
+     * base application it ran at the end of every later request and was never removed:
+     * the Blade engine, which Octane resolves again on every request, registers one each
+     * time, so a worker ran and kept one more callback per request it had served.
+     *
+     * @param  callable|string  $callback
+     * @return $this
+     */
     public function terminating($callback)
     {
+        $scope = $this->getRequestScope();
+
+        if ($scope instanceof RequestScope) {
+            $scope->addTerminatingCallback($callback);
+
+            return $this;
+        }
+
         $this->getCurrentApp()->terminating($callback);
+
         return $this;
     }
 
     /**
      * Terminate the application.
      *
+     * Runs the callbacks registered at boot, then the ones this request registered.
+     *
      * @return void
      */
     public function terminate()
     {
         $this->getCurrentApp()->terminate();
+
+        $scope = $this->getRequestScope();
+
+        if ($scope instanceof RequestScope) {
+            // A callback may register another one; it runs in the same pass.
+            for ($index = 0; ($callback = $scope->terminatingCallback($index)) !== null; $index++) {
+                $this->call($callback);
+            }
+        }
     }
 
     /**
@@ -1694,14 +1725,67 @@ class CoroutineApplication extends Application
         return $this->getCurrentApp()->provideFacades($namespace);
     }
 
+    /**
+     * Register a rebinding callback.
+     *
+     * A rebinding of a request-scoped abstract belongs to the request. Laravel's
+     * AuthManager calls refresh('request', $guard, 'setRequest') for every guard
+     * it creates, and the auth manager is request-scoped, so delegating to the
+     * base application kept one callback (and the guard, request, session and
+     * user it captures) per request for the life of the worker. It also handed
+     * the guard the base application's request instead of the current one.
+     *
+     * @param  string  $abstract
+     * @param  \Closure  $callback
+     * @return mixed
+     */
     public function rebinding($abstract, \Closure $callback)
     {
+        $scope = $this->getRequestScope();
+
+        if ($scope instanceof RequestScope
+            && is_string($key = $this->normalizeAbstract($abstract))
+            && $scope->has($key)) {
+            $scope->addReboundCallback($key, $callback);
+
+            return $this->make($key);
+        }
+
         return $this->getCurrentApp()->rebinding($abstract, $callback);
     }
 
     public function refresh($abstract, $target, $method)
     {
-        return $this->getCurrentApp()->refresh($abstract, $target, $method);
+        return $this->rebinding($abstract, function ($app, $instance) use ($target, $method) {
+            $target->{$method}($instance);
+        });
+    }
+
+    /**
+     * Fire the "rebound" callbacks for the given abstract type.
+     *
+     * Request-local callbacks run first, then any registered on this proxy.
+     *
+     * @param  string  $abstract
+     * @return void
+     */
+    protected function rebound($abstract)
+    {
+        $scope = $this->getRequestScope();
+
+        if ($scope instanceof RequestScope && is_string($key = $this->normalizeAbstract($abstract))) {
+            $callbacks = $scope->reboundCallbacks($key);
+
+            if ($callbacks !== []) {
+                $instance = $this->make($key);
+
+                foreach ($callbacks as $callback) {
+                    $callback($this, $instance);
+                }
+            }
+        }
+
+        parent::rebound($abstract);
     }
 
     public function registerConfiguredProviders()
