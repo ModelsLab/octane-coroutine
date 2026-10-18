@@ -374,6 +374,7 @@ class RequestScope
             \Illuminate\Session\Middleware\StartSession::class => $this->createStartSessionMiddleware($sandbox),
             'url' => $this->createUrlGenerator($sandbox),
             \Illuminate\Foundation\Vite::class => $this->createVite(),
+            'blade.compiler', \Illuminate\View\Compilers\BladeCompiler::class => $this->createBladeCompiler(),
             'view', \Illuminate\Contracts\View\Factory::class => $this->createViewFactory($sandbox),
             \Illuminate\Routing\Contracts\CallableDispatcher::class => new \Illuminate\Routing\CallableDispatcher($sandbox),
             \Illuminate\Routing\Contracts\ControllerDispatcher::class => new \Illuminate\Routing\ControllerDispatcher($sandbox),
@@ -665,6 +666,11 @@ class RequestScope
             \Illuminate\Contracts\View\Factory::class => $this->storeScopedAliases([
                 'view',
                 \Illuminate\Contracts\View\Factory::class,
+            ], $resolved),
+            'blade.compiler',
+            \Illuminate\View\Compilers\BladeCompiler::class => $this->storeScopedAliases([
+                'blade.compiler',
+                \Illuminate\View\Compilers\BladeCompiler::class,
             ], $resolved),
             'translator',
             \Illuminate\Contracts\Translation\Translator::class,
@@ -1527,7 +1533,99 @@ class RequestScope
         $view->share('app', $sandbox);
         $view->flushState();
 
+        if (method_exists($view, 'getEngineResolver')) {
+            $this->setObjectProperty($view, 'engines', $this->createEngineResolver($view->getEngineResolver(), $sandbox));
+        }
+
         return $view;
+    }
+
+    /**
+     * Create an isolated Blade compiler for the current coroutine.
+     *
+     * BladeCompiler keeps the view it is compiling in $path. compile() sets the
+     * path, reads the source file, then writes to getCompiledPath($this->path).
+     * The read is a hooked file call, so the coroutine yields in between. On the
+     * shared compiler a concurrent request that compiled another view meanwhile
+     * moved the path, and one view's compiled PHP was written into the other
+     * view's cache file, where it stayed until the cache was cleared. The clone
+     * keeps boot-time directives, components and precompilers, and starts with
+     * empty per-compile state.
+     *
+     * @return \Illuminate\View\Compilers\BladeCompiler|null
+     */
+    protected function createBladeCompiler(): ?\Illuminate\View\Compilers\BladeCompiler
+    {
+        if (! $this->app->bound('blade.compiler')) {
+            return null;
+        }
+
+        $compiler = $this->app->make('blade.compiler');
+
+        if (! $compiler instanceof \Illuminate\View\Compilers\BladeCompiler) {
+            return null;
+        }
+
+        $compiler = clone $compiler;
+
+        foreach ([
+            'path' => null,
+            'footer' => [],
+            'rawBlocks' => [],
+            'firstCaseInSwitch' => true,
+            'forElseCounter' => 0,
+            'lastSection' => null,
+            'lastFragment' => null,
+        ] as $property => $value) {
+            $this->setObjectProperty($compiler, $property, $value);
+        }
+
+        return $compiler;
+    }
+
+    /**
+     * Create an engine resolver whose Blade engine uses the coroutine's compiler.
+     *
+     * The cloned view factory still pointed at the worker's EngineResolver, so
+     * every coroutine rendered through one CompilerEngine and one BladeCompiler.
+     * The engine also tracks the views it is rendering (for error messages) and
+     * which compiled views it has already checked. The Blade engine is built
+     * lazily from the worker's engine, so a package's engine subclass is kept,
+     * and the worker's resolver is never changed. Other engines stay shared:
+     * the PHP and file engines hold no per-render state.
+     *
+     * @param  \Illuminate\View\Engines\EngineResolver  $baseResolver
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return \Illuminate\View\Engines\EngineResolver
+     */
+    protected function createEngineResolver(\Illuminate\View\Engines\EngineResolver $baseResolver, Application $sandbox): \Illuminate\View\Engines\EngineResolver
+    {
+        $resolvers = $this->getObjectProperty($baseResolver, 'resolvers');
+
+        if (! is_array($resolvers) || ! isset($resolvers['blade'])) {
+            return $baseResolver;
+        }
+
+        $resolver = clone $baseResolver;
+
+        $resolver->register('blade', function () use ($baseResolver, $sandbox) {
+            // The worker's engine is only a template. Resolving it once (instead of
+            // calling the framework's resolver per request) keeps Laravel 10, whose
+            // resolver registers a terminating callback on the worker app, from
+            // adding one callback for every request.
+            $engine = clone $baseResolver->resolve('blade');
+
+            if ($engine instanceof \Illuminate\View\Engines\CompilerEngine
+                && ($compiler = $sandbox->make('blade.compiler')) instanceof \Illuminate\View\Compilers\CompilerInterface) {
+                $this->setObjectProperty($engine, 'compiler', $compiler);
+                $this->setObjectProperty($engine, 'lastCompiled', []);
+                $this->setObjectProperty($engine, 'compiledOrNotExpired', []);
+            }
+
+            return $engine;
+        });
+
+        return $resolver;
     }
 
     /**
