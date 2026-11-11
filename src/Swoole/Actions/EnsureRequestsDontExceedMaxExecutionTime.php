@@ -2,6 +2,7 @@
 
 namespace Laravel\Octane\Swoole\Actions;
 
+use Laravel\Octane\Swoole\Coroutine\LivewireCoroutineMutex;
 use Laravel\Octane\Swoole\SwooleExtension;
 use Swoole\Coroutine;
 use Swoole\Http\Response;
@@ -60,6 +61,7 @@ class EnsureRequestsDontExceedMaxExecutionTime
                 error_log("⏱️ Request timeout (client gone): Coroutine #{$coroutineId} ran {$age}s of {$this->maxExecutionTime}s budget on worker {$row['worker_pid']}; fd {$row['fd']} already closed");
 
                 $this->cancelCoroutine($coroutineId);
+                $this->resetLivewireMutex();
 
                 continue;
             }
@@ -68,6 +70,7 @@ class EnsureRequestsDontExceedMaxExecutionTime
             error_log("⏱️ Request timeout: Coroutine #{$coroutineId} ran {$age}s, exceeded {$this->maxExecutionTime}s max execution time (worker {$row['worker_pid']}, fd {$row['fd']})");
 
             $cancelled = $this->cancelCoroutine($coroutineId);
+            $this->resetLivewireMutex();
 
             if (!$cancelled) {
                 // If coroutine cancellation failed, ask Swoole to recycle the
@@ -132,6 +135,15 @@ class EnsureRequestsDontExceedMaxExecutionTime
         } catch (\Throwable $e) {
             error_log("❌ Error cancelling coroutine #{$coroutineId}: " . $e->getMessage());
             return false;
+        }
+    }
+
+    protected function resetLivewireMutex(): void
+    {
+        try {
+            (new LivewireCoroutineMutex)->forceReset();
+        } catch (\Throwable $e) {
+            error_log('⚠️ Failed to reset LivewireCoroutineMutex: '.$e->getMessage());
         }
     }
 

@@ -34,7 +34,9 @@ With 1-second blocking operations, this means only **~8 requests/second** throug
 
 ## 🎯 The Solution: Runtime Coroutine Hooks
 
-This fork enables **Swoole's coroutine runtime hooks** (`SWOOLE_HOOK_ALL`), which automatically converts PHP's blocking functions into non-blocking, coroutine-safe versions:
+This fork enables **Swoole's coroutine runtime hooks** (`SWOOLE_HOOK_ALL` minus `FILE`/`STDIO` by default), which automatically converts PHP's blocking network/sleep functions into non-blocking, coroutine-safe versions:
+
+> **Note:** `SWOOLE_HOOK_FILE` / `SWOOLE_HOOK_STDIO` stay off by default. Hooked file I/O deadlocks ZipArchive, SplFileObject, PhpSpreadsheet, and hangs Livewire uploads. Re-enable only via `octane.swoole.hook_file` / `hook_stdio` (or an explicit `hook_flags` bitmask) if your stack is coroutine-safe.
 
 ```
 32 workers × ~87 concurrent requests per worker = 2,784+ concurrent requests
@@ -396,14 +398,14 @@ Each worker can efficiently handle **~87 concurrent requests** thanks to corouti
 
 ### Runtime Hooks
 
-Enabled automatically on worker start:
+Enabled automatically on worker start via `RuntimeHooks` (`SWOOLE_HOOK_ALL` minus `FILE`/`STDIO` by default):
 
 ```php
 // src/Swoole/Handlers/OnWorkerStart.php
-\Swoole\Runtime::enableCoroutine(SWOOLE_HOOK_ALL);
+RuntimeHooks::enable($swooleConfig);
 ```
 
-This converts all blocking I/O to coroutine-safe operations without any code changes required.
+Network/sleep I/O becomes coroutine-safe without app code changes. File hooks stay off so ZipArchive / Livewire uploads do not hang — override with `octane.swoole.hook_file` if needed.
 
 ### Worker Initialization
 

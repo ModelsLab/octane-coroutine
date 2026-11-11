@@ -345,6 +345,14 @@ class RequestScope
             return $this->createSentryTracingMiddleware();
         }
 
+        if ($this->isStanclTenantContractBinding($key)) {
+            return $this->resolveStanclTenant($sandbox);
+        }
+
+        if ($this->isStanclTenancyBinding($key)) {
+            return $this->createTenancy($sandbox);
+        }
+
         return match ($key) {
             'auth' => $this->createAuthManager($sandbox),
             \Illuminate\Bus\Dispatcher::class => $this->createBusDispatcher($sandbox),
@@ -356,10 +364,12 @@ class RequestScope
             'cookie' => $this->createCookieJar(),
             'db.transactions' => new DatabaseTransactionsManager,
             DeferredCallbackCollection::class => new DeferredCallbackCollection,
+            'events', EventDispatcher::class, \Illuminate\Events\Dispatcher::class => $this->createEventDispatcher($sandbox),
             'gate', \Illuminate\Contracts\Auth\Access\Gate::class, \Illuminate\Auth\Access\Gate::class => $this->createGate($sandbox),
             'filesystem', FilesystemManager::class, \Illuminate\Contracts\Filesystem\Factory::class => $this->createFilesystemManager($sandbox),
             'filesystem.disk', \Illuminate\Contracts\Filesystem\Filesystem::class => $this->createFilesystemDisk($sandbox),
             'filesystem.cloud', \Illuminate\Contracts\Filesystem\Cloud::class => $this->createFilesystemCloud($sandbox),
+            \Illuminate\Log\Context\Repository::class => $this->createLogContextRepository($sandbox),
             \Inertia\ResponseFactory::class => $this->createInertiaResponseFactory(),
             'log', \Psr\Log\LoggerInterface::class => $this->createLogManager($sandbox),
             'queue', QueueManager::class, \Illuminate\Contracts\Queue\Factory::class, \Illuminate\Contracts\Queue\Monitor::class => $this->createQueueManager($sandbox),
@@ -375,11 +385,154 @@ class RequestScope
             'url' => $this->createUrlGenerator($sandbox),
             \Illuminate\Foundation\Vite::class => $this->createVite(),
             'view', \Illuminate\Contracts\View\Factory::class => $this->createViewFactory($sandbox),
-            \Illuminate\Routing\Contracts\CallableDispatcher::class => new \Illuminate\Routing\CallableDispatcher($sandbox),
-            \Illuminate\Routing\Contracts\ControllerDispatcher::class => new \Illuminate\Routing\ControllerDispatcher($sandbox),
+            'themes.finder' => $this->createThemesFinder($sandbox),
+            \Illuminate\Routing\Contracts\CallableDispatcher::class => $this->createCallableDispatcher($sandbox),
+            \Illuminate\Routing\Contracts\ControllerDispatcher::class => $this->createControllerDispatcher($sandbox),
             \Illuminate\Contracts\Routing\ResponseFactory::class => $this->createResponseFactory($sandbox),
             default => null,
         };
+    }
+
+    /**
+     * Create a fresh Laravel Context repository for this coroutine.
+     *
+     * Context is registered as scoped on the worker app; without a per-request
+     * instance, tenant_id (and other keys) leak across concurrent coroutines.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return \Illuminate\Log\Context\Repository
+     */
+    protected function createLogContextRepository(Application $sandbox): \Illuminate\Log\Context\Repository
+    {
+        return new \Illuminate\Log\Context\Repository(
+            $sandbox->make(EventDispatcher::class)
+        );
+    }
+
+    /**
+     * Create an isolated Stancl Tenancy manager for this coroutine.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function createTenancy(Application $sandbox)
+    {
+        $tenancy = clone $this->app->make(\Stancl\Tenancy\Tenancy::class);
+        $tenancy->initialized = false;
+        $tenancy->tenant = null;
+
+        return $tenancy;
+    }
+
+    /**
+     * Resolve Stancl's Tenant contract from the coroutine-local Tenancy manager.
+     *
+     * The framework bind is `fn ($app) => $app[Tenancy::class]->tenant`. When that
+     * closure runs against the worker base container it reads the shared Tenancy
+     * singleton (usually null), while `tenancy()` already returns the RequestScope
+     * clone — so `tenancy()->initialized` is true but `tenant()` is null and queue
+     * payload hooks call getTenantKey() on null during deferred dispatch.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return mixed
+     */
+    protected function resolveStanclTenant(Application $sandbox)
+    {
+        return $sandbox->make(\Stancl\Tenancy\Tenancy::class)->tenant;
+    }
+
+    /**
+     * Determine if the binding is Stancl's Tenant contract.
+     */
+    protected function isStanclTenantContractBinding(string $key): bool
+    {
+        return interface_exists(\Stancl\Tenancy\Contracts\Tenant::class)
+            && $key === \Stancl\Tenancy\Contracts\Tenant::class
+            && $this->app->bound(\Stancl\Tenancy\Tenancy::class);
+    }
+
+    /**
+     * Determine if the binding is Stancl's Tenancy manager.
+     */
+    protected function isStanclTenancyBinding(string $key): bool
+    {
+        return class_exists(\Stancl\Tenancy\Tenancy::class)
+            && ($key === 'tenancy' || $key === \Stancl\Tenancy\Tenancy::class)
+            && $this->app->bound(\Stancl\Tenancy\Tenancy::class);
+    }
+
+    /**
+     * Create a controller dispatcher for the coroutine sandbox.
+     *
+     * Honor the base application's ControllerDispatcher binding (e.g. Bright's
+     * dispatcher that wraps array controller returns in Themes Responsable).
+     * Hard-coding Laravel's stock dispatcher skips that pipeline and turns
+     * views like /login into blank JSON `[]` under enable_coroutine.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return \Illuminate\Routing\Contracts\ControllerDispatcher
+     */
+    protected function createControllerDispatcher(Application $sandbox): \Illuminate\Routing\Contracts\ControllerDispatcher
+    {
+        $class = $this->resolveBoundConcreteClass(
+            \Illuminate\Routing\Contracts\ControllerDispatcher::class,
+            \Illuminate\Routing\ControllerDispatcher::class,
+        );
+
+        return new $class($sandbox);
+    }
+
+    /**
+     * Create a callable dispatcher for the coroutine sandbox.
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return \Illuminate\Routing\Contracts\CallableDispatcher
+     */
+    protected function createCallableDispatcher(Application $sandbox): \Illuminate\Routing\Contracts\CallableDispatcher
+    {
+        $class = $this->resolveBoundConcreteClass(
+            \Illuminate\Routing\Contracts\CallableDispatcher::class,
+            \Illuminate\Routing\CallableDispatcher::class,
+        );
+
+        return new $class($sandbox);
+    }
+
+    /**
+     * Resolve a concrete class from the base container binding.
+     *
+     * Laravel stores class-string binds as Closures in getBindings(), so we
+     * may need to instantiate once on the base app to discover the class, then
+     * construct a fresh instance with the coroutine sandbox.
+     *
+     * @param  class-string  $abstract
+     * @param  class-string  $default
+     * @return class-string
+     */
+    protected function resolveBoundConcreteClass(string $abstract, string $default): string
+    {
+        if (! $this->app->bound($abstract)) {
+            return $default;
+        }
+
+        $binding = $this->app->getBindings()[$abstract] ?? null;
+        $concrete = is_array($binding) ? ($binding['concrete'] ?? null) : null;
+
+        if (is_string($concrete) && class_exists($concrete)) {
+            return $concrete;
+        }
+
+        try {
+            $resolved = $this->app->make($abstract);
+
+            if (is_object($resolved)) {
+                return $resolved::class;
+            }
+        } catch (\Throwable) {
+            // Fall back to the Laravel default dispatcher.
+        }
+
+        return $default;
     }
 
     /**
@@ -723,6 +876,11 @@ class RequestScope
                 'queue.connection',
                 \Illuminate\Contracts\Queue\Queue::class,
             ], $resolved),
+            'tenancy',
+            'Stancl\\Tenancy\\Tenancy' => $this->storeScopedAliases([
+                'tenancy',
+                \Stancl\Tenancy\Tenancy::class,
+            ], $resolved),
             default => null,
         };
     }
@@ -941,6 +1099,26 @@ class RequestScope
     protected function cloneConfig()
     {
         return clone $this->app->make('config');
+    }
+
+    /**
+     * Create an isolated event dispatcher bound to the coroutine sandbox.
+     *
+     * Class listeners are resolved through the dispatcher's container. Leaving
+     * that on the worker base app makes constructor-injected Request resolve
+     * outside RequestScope — so StartSession's store never appears on the
+     * request and login listeners throw "Session store not set on request."
+     *
+     * @param  \Illuminate\Foundation\Application  $sandbox
+     * @return \Illuminate\Contracts\Events\Dispatcher
+     */
+    protected function createEventDispatcher(Application $sandbox): EventDispatcher
+    {
+        $events = clone $this->app->make('events');
+
+        $this->setObjectProperty($events, 'container', $sandbox);
+
+        return $events;
     }
 
     /**
@@ -1522,12 +1700,27 @@ class RequestScope
     {
         /** @var \Illuminate\View\Factory $view */
         $view = clone $this->app->make('view');
+        $view->setFinder(clone $view->getFinder());
         $view->setContainer($sandbox);
         $view->share('__env', $view);
         $view->share('app', $sandbox);
         $view->flushState();
 
         return $view;
+    }
+
+    /**
+     * Resolve the theme view finder for the current coroutine.
+     *
+     * Diviky registers themes.finder as a worker singleton and assigns it to the
+     * view factory. Livewire components temporarily prepend colocated view paths
+     * (for example analytics "sent") via that finder. Without a per-coroutine
+     * finder, concurrent requests flush or reset paths and trigger random
+     * "View [sent] not found" errors under Swoole coroutines.
+     */
+    protected function createThemesFinder(Application $sandbox): \Illuminate\View\ViewFinderInterface
+    {
+        return $sandbox->make(\Illuminate\Contracts\View\Factory::class)->getFinder();
     }
 
     /**

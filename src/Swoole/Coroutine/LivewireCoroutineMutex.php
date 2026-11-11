@@ -8,6 +8,15 @@ class LivewireCoroutineMutex
 {
     private const DEPTH_KEY = 'octane.livewire_mutex_depth';
 
+    /**
+     * Seconds to wait for the Livewire render lock before healing a stuck channel.
+     *
+     * A cancelled/timed-out coroutine can skip finally blocks and leave the
+     * channel empty, which otherwise deadlocks every later Livewire request
+     * on this worker (including file-upload updates).
+     */
+    private const ACQUIRE_TIMEOUT_SECONDS = 30.0;
+
     private static $channel = null;
 
     public function acquire(): void
@@ -24,7 +33,13 @@ class LivewireCoroutineMutex
             return;
         }
 
-        $this->channel()->pop();
+        $token = $this->channel()->pop(self::ACQUIRE_TIMEOUT_SECONDS);
+
+        if ($token === false) {
+            error_log('⚠️ LivewireCoroutineMutex acquire timed out after '.self::ACQUIRE_TIMEOUT_SECONDS.'s; resetting lock to unblock Livewire');
+            $this->forceReset();
+            $this->channel()->pop(0.01);
+        }
 
         Context::set(self::DEPTH_KEY, 1);
     }
@@ -61,6 +76,24 @@ class LivewireCoroutineMutex
         while ((int) Context::get(self::DEPTH_KEY, 0) > 0) {
             $this->release();
         }
+    }
+
+    /**
+     * Re-seed the lock after a cancelled coroutine may have leaked it.
+     */
+    public function forceReset(): void
+    {
+        if (! class_exists(Channel::class)) {
+            return;
+        }
+
+        $channel = $this->channel();
+
+        while ($channel->pop(0.001) !== false) {
+            // Drain any residual tokens before re-seeding.
+        }
+
+        $channel->push(true);
     }
 
     /**

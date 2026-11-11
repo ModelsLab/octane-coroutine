@@ -7,6 +7,7 @@ use Illuminate\Events\Dispatcher;
 use Illuminate\Foundation\Application;
 use Illuminate\View\Engines\EngineResolver;
 use Illuminate\View\Factory;
+use Illuminate\View\FileViewFinder;
 use Illuminate\View\ViewFinderInterface;
 use Laravel\Octane\Swoole\Coroutine\Context;
 use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
@@ -60,6 +61,55 @@ class RequestScopeViewIsolationTest extends TestCase
             $this->assertNull($base->make('view')->shared('request_id'));
             $this->assertSame($secondView, $secondView->shared('__env'));
             $this->assertSame($secondView, $sandbox->make(ViewFactoryContract::class));
+        } finally {
+            Context::clear();
+        }
+    }
+
+    public function test_view_finder_paths_are_isolated_per_request_scope(): void
+    {
+        $base = new Application(__DIR__);
+
+        $finder = new FileViewFinder(
+            new \Illuminate\Filesystem\Filesystem,
+            [__DIR__],
+        );
+
+        $view = new Factory(
+            new EngineResolver,
+            $finder,
+            new Dispatcher($base)
+        );
+        $view->setContainer($base);
+
+        $base->instance('view', $view);
+        $base->instance(ViewFactoryContract::class, $view);
+
+        $sandbox = new CoroutineApplication($base);
+
+        Context::set('octane.request_scope', new RequestScope($base));
+
+        try {
+            $firstFinder = $sandbox->make('view')->getFinder();
+            $firstFinder->addLocation('/tmp/octane-coroutine-scope-alpha');
+
+            $this->assertContains('/tmp/octane-coroutine-scope-alpha', $firstFinder->getPaths());
+        } finally {
+            Context::clear();
+        }
+
+        Context::set('octane.request_scope', new RequestScope($base));
+
+        try {
+            $secondFinder = $sandbox->make('view')->getFinder();
+            $secondFinder->setPaths([__DIR__]);
+
+            $this->assertSame([__DIR__], $secondFinder->getPaths());
+            $this->assertNotContains('/tmp/octane-coroutine-scope-alpha', $secondFinder->getPaths());
+
+            $firstFinderAgain = $sandbox->make('view')->getFinder();
+            $this->assertSame($secondFinder, $firstFinderAgain);
+            $this->assertNotContains('/tmp/octane-coroutine-scope-alpha', $firstFinderAgain->getPaths());
         } finally {
             Context::clear();
         }

@@ -16,6 +16,7 @@ use Laravel\Octane\Worker;
 use Swoole\Http\Server;
 use Throwable;
 use Laravel\Octane\Swoole\Coroutine\CoroutineApplication;
+use Laravel\Octane\Swoole\Coroutine\RuntimeHooks;
 use Illuminate\Container\Container;
 use Illuminate\Support\Facades\Facade;
 
@@ -47,8 +48,12 @@ class OnWorkerStart
         $workerType = $isTaskWorker ? 'TASK WORKER' : 'WORKER';
         error_log("🚀 {$workerType} #{$workerId} STARTING (max_request: {$maxRequest}, reload_async: {$reloadAsync})");
         
-        // Enable coroutine hooks to make blocking functions (sleep, file_get_contents, etc.) coroutine-safe
-        \Swoole\Runtime::enableCoroutine(SWOOLE_HOOK_ALL);
+        // Enable coroutine hooks (FILE/STDIO excluded by default — see RuntimeHooks)
+        $swooleConfig = is_array($this->serverState['octaneConfig']['swoole'] ?? null)
+            ? $this->serverState['octaneConfig']['swoole']
+            : [];
+
+        RuntimeHooks::enable($swooleConfig);
         
         if ($this->shouldClearOpcodeCache()) {
             $this->clearOpcodeCache();

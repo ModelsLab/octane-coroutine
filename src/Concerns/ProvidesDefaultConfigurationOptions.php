@@ -102,6 +102,7 @@ trait ProvidesDefaultConfigurationOptions
             \Laravel\Octane\Listeners\FlushStrCache::class,
             \Laravel\Octane\Listeners\FlushTranslatorCache::class,
             \Laravel\Octane\Listeners\FlushVite::class,
+            \Laravel\Octane\Listeners\PrepareBladeComponentsForNextOperation::class,
 
             // First-Party Packages...
             \Laravel\Octane\Listeners\PrepareInertiaForNextOperation::class,

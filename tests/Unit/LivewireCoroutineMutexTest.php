@@ -91,4 +91,34 @@ class LivewireCoroutineMutexTest extends TestCase
 
         $this->assertTrue($completed);
     }
+
+    public function test_force_reset_unblocks_a_leaked_lock(): void
+    {
+        if (! extension_loaded('swoole') || ! class_exists(Channel::class)) {
+            $this->markTestSkipped('Swoole is required for coroutine mutex tests.');
+        }
+
+        $acquiredAfterReset = false;
+
+        \Swoole\Coroutine\run(function () use (&$acquiredAfterReset): void {
+            $mutex = new LivewireCoroutineMutex;
+
+            Context::clear();
+            $mutex->acquire();
+
+            // Simulate a cancelled coroutine leaking the lock without release.
+            Context::clear();
+
+            $mutex->forceReset();
+
+            Context::clear();
+            $mutex->acquire();
+            $acquiredAfterReset = true;
+            $mutex->release();
+
+            Context::clear();
+        });
+
+        $this->assertTrue($acquiredAfterReset);
+    }
 }
