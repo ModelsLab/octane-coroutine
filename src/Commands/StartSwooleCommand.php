@@ -143,7 +143,7 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
      */
     protected function defaultServerOptions(SwooleExtension $extension)
     {
-        return array_merge([
+        $options = array_merge([
             // Enable coroutine support for async I/O operations
             'enable_coroutine' => true,
             
@@ -205,6 +205,12 @@ class StartSwooleCommand extends Command implements SignalableCommandInterface
             // Number of worker processes
             'worker_num' => $this->workerCount($extension),
         ], config('octane.swoole.options', []));
+
+        // Runtime hooks + Livewire coroutine locking require request callbacks
+        // to run inside coroutines. Forcing false deadlocks uploads/updates.
+        $options['enable_coroutine'] = true;
+
+        return $options;
     }
 
     /**

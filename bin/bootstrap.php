@@ -4,16 +4,12 @@ ini_set('display_errors', 'stderr');
 
 $_ENV['APP_RUNNING_IN_CONSOLE'] = false;
 
-use Swoole\Runtime;
-
 // Configure coroutine settings BEFORE any coroutine operations
 // max_coroutine: Maximum number of concurrent coroutines (application-level concurrency)
 // Default: 3000, Recommended for high traffic: 100000
 Swoole\Coroutine::set([
     'max_coroutine' => 100000,
 ]);
-
-Runtime::enableCoroutine(SWOOLE_HOOK_ALL);
 
 /*
 |--------------------------------------------------------------------------
@@ -55,5 +51,21 @@ if (! is_file($autoload_file = "{$vendorDir}/autoload.php")) {
 }
 
 require_once $autoload_file;
+
+/*
+|--------------------------------------------------------------------------
+| Enable Coroutine Runtime Hooks
+|--------------------------------------------------------------------------
+|
+| FILE/STDIO hooks are excluded by default — ZipArchive, SplFileObject,
+| PhpSpreadsheet, and Livewire uploads hang under SWOOLE_HOOK_FILE.
+|
+*/
+
+$swooleConfig = (isset($serverState) && is_array($serverState['octaneConfig']['swoole'] ?? null))
+    ? $serverState['octaneConfig']['swoole']
+    : [];
+
+Laravel\Octane\Swoole\Coroutine\RuntimeHooks::enable($swooleConfig);
 
 return $basePath;

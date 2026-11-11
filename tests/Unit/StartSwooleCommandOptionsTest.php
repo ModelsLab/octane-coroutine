@@ -38,6 +38,20 @@ class StartSwooleCommandOptionsTest extends TestCase
         $this->assertSame(10, $options['max_request_grace']);
         $this->assertSame(10, $options['task_max_request_grace']);
     }
+
+    public function test_swoole_options_force_enable_coroutine_true(): void
+    {
+        config(['octane.swoole.options.enable_coroutine' => false]);
+
+        $command = new TestableStartSwooleCommandForOptions([
+            'max-requests' => 100,
+            'max-request-grace' => null,
+        ]);
+
+        $options = $command->defaultServerOptionsForTest(new SwooleExtension());
+
+        $this->assertTrue($options['enable_coroutine']);
+    }
 }
 
 class TestableStartSwooleCommandForOptions extends StartSwooleCommand

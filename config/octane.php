@@ -228,6 +228,25 @@ return [
 
         'timeout_sweep_interval_ms' => env('OCTANE_TIMEOUT_SWEEP_INTERVAL_MS', 5000),
 
+        /*
+        |--------------------------------------------------------------------------
+        | Runtime Hook Flags
+        |--------------------------------------------------------------------------
+        |
+        | By default Octane enables SWOOLE_HOOK_ALL except FILE and STDIO.
+        | Hooked file I/O deadlocks ZipArchive / SplFileObject / PhpSpreadsheet
+        | and hangs Livewire (and similar) uploads on Swoole workers.
+        |
+        | Set hook_file / hook_stdio to true only if you know your I/O stack is
+        | coroutine-safe. Or pass an explicit integer bitmask via hook_flags.
+        |
+        */
+
+        'hook_flags' => null,
+
+        'hook_file' => env('OCTANE_SWOOLE_HOOK_FILE', false),
+
+        'hook_stdio' => env('OCTANE_SWOOLE_HOOK_STDIO', false),
 
         /*
         |--------------------------------------------------------------------------
