@@ -2,22 +2,14 @@
 
 namespace Laravel\Octane;
 
-use Illuminate\Contracts\Encryption\DecryptException;
 use Illuminate\Contracts\Events\Dispatcher;
-use Illuminate\Http\Request;
-use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\ServiceProvider;
 use Laravel\Octane\Cache\OctaneArrayStore;
 use Laravel\Octane\Cache\OctaneStore;
 use Laravel\Octane\Contracts\DispatchesCoroutines;
 use Laravel\Octane\Events\TickReceived;
-use Laravel\Octane\Exceptions\DdException;
-use Laravel\Octane\Exceptions\TaskException;
-use Laravel\Octane\Exceptions\TaskTimeoutException;
-use Laravel\Octane\Facades\Octane as OctaneFacade;
 use Laravel\Octane\FrankenPhp\ServerProcessInspector as FrankenPhpServerProcessInspector;
 use Laravel\Octane\FrankenPhp\ServerStateFile as FrankenPhpServerStateFile;
 use Laravel\Octane\RoadRunner\ServerProcessInspector as RoadRunnerServerProcessInspector;
@@ -27,7 +19,6 @@ use Laravel\Octane\Swoole\ServerProcessInspector as SwooleServerProcessInspector
 use Laravel\Octane\Swoole\ServerStateFile as SwooleServerStateFile;
 use Laravel\Octane\Swoole\SignalDispatcher;
 use Laravel\Octane\Swoole\SwooleCoroutineDispatcher;
-use Laravel\Octane\Swoole\SwooleTaskDispatcher;
 
 class OctaneServiceProvider extends ServiceProvider
 {
@@ -183,7 +174,6 @@ class OctaneServiceProvider extends ServiceProvider
 
         $this->registerCacheDriver();
         $this->registerCommands();
-        $this->registerHttpTaskHandlingRoutes();
         $this->registerPublishing();
         $this->registerLivewireCoroutineMutex();
     }
@@ -288,41 +278,6 @@ class OctaneServiceProvider extends ServiceProvider
                 Commands\StopCommand::class,
             ]);
         }
-    }
-
-    /**
-     * Register the Octane routes that handle tasks from invokers not in a Server context.
-     *
-     * @return void
-     */
-    protected function registerHttpTaskHandlingRoutes()
-    {
-        OctaneFacade::route('POST', '/octane/resolve-tasks', function (Request $request) {
-            try {
-                return new Response(serialize((new SwooleTaskDispatcher)->resolve(
-                    unserialize(Crypt::decryptString($request->input('tasks'))),
-                    $request->input('wait')
-                )), 200);
-            } catch (DecryptException) {
-                return new Response('', 403);
-            } catch (TaskException|DdException) {
-                return new Response('', 500);
-            } catch (TaskTimeoutException) {
-                return new Response('', 504);
-            }
-        });
-
-        OctaneFacade::route('POST', '/octane/dispatch-tasks', function (Request $request) {
-            try {
-                (new SwooleTaskDispatcher)->dispatch(
-                    unserialize(Crypt::decryptString($request->input('tasks'))),
-                );
-            } catch (DecryptException) {
-                return new Response('', 403);
-            }
-
-            return new Response('', 200);
-        });
     }
 
     /**
